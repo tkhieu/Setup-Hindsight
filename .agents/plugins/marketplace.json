@@ -1,0 +1,20 @@
+{
+  "name": "setup-hindsight",
+  "interface": {
+    "displayName": "Setup Hindsight"
+  },
+  "plugins": [
+    {
+      "name": "hindsight-client",
+      "source": {
+        "source": "local",
+        "path": "./plugins/hindsight-client"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

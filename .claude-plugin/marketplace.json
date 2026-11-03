@@ -1,0 +1,14 @@
+{
+  "name": "setup-hindsight",
+  "description": "Công cụ cài Hindsight trên máy phát triển",
+  "owner": {
+    "name": "tkhieu"
+  },
+  "plugins": [
+    {
+      "name": "hindsight-client",
+      "source": "./plugins/hindsight-client",
+      "description": "Cài đặt và kiểm tra Hindsight cho Claude Code và Codex"
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+workstation_dir=$(dirname "$(dirname "$(readlink -f "$0")")")
+exec "$workstation_dir/../plugins/hindsight-client/scripts/hindsight-client-setup" "$@"
