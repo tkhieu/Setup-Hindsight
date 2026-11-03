@@ -1,8 +1,9 @@
 # Installed by bin/install-systemd.sh, which resolves @CONFIG_DIR@.
 [Unit]
-Description=Hindsight weekly upstream release check (auto patch upgrade; issue for minor/major)
+Description=Hindsight weekly upstream release check (auto patch upgrade; notify for minor/major)
 After=network-online.target docker.service
 Wants=network-online.target
+OnFailure=ops-notify@%N.service
 
 [Service]
 Type=oneshot

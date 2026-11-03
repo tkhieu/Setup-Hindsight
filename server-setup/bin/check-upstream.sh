@@ -3,20 +3,16 @@
 # PATCH bumps (same MAJOR.MINOR, higher PATCH, e.g. 1.1.0 -> 1.1.1) are
 # upgraded AUTOMATICALLY via `bin/upgrade.sh --yes --auto-rollback --smoke`;
 # MINOR/MAJOR bumps are never applied automatically, only reported. All
-# notifications go to a GitHub issue on tkhieu/Setup-Hindsight, labeled
-# `hindsight-upgrade`, deduped by exact title so this never spams. See
-# docs/PLAYBOOK.md §8b for what each outcome/issue means and how to read it.
+# notifications go through ops-notify. Minor/major release notices are
+# deduped by kind and version in local state. See docs/PLAYBOOK.md §8b.
 #
 # Usage: bin/check-upstream.sh [--dry-run]
 #   --dry-run   does the network reads (latest-release lookup, GHCR tag
 #               check) but performs no upgrade, no git commit/push, and
-#               opens no issue — prints what it would have done instead.
+#               sends no notification — prints what it would have done instead.
 set -euo pipefail
 
-# python3 is REQUIRED (all JSON parsing/encoding below goes through it, no
-# sed/awk fallback — a real parser is the only safe way to scan a JSON
-# array or build a JSON string literal). Confirmed present on the server;
-# fail loud immediately instead of a confusing failure deep inside json.sh.
+# python3 is required for parsing the release and GHCR token JSON.
 command -v python3 >/dev/null 2>&1 \
   || { echo "ERROR: python3 is required (JSON parsing against the GitHub/GHCR APIs) but was not found on PATH." >&2; exit 1; }
 
@@ -30,8 +26,8 @@ REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 . "$CONFIG_DIR/bin/lib/lock.sh"
 
 UPSTREAM_REPO="vectorize-io/hindsight"
-ISSUE_REPO="tkhieu/Setup-Hindsight"
-LABEL="hindsight-upgrade"
+NOTIFIED_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hindsight/upgrade-notified"
+OPS_NOTIFY_BIN="${OPS_NOTIFY_BIN:-$HOME/.local/bin/ops-notify}"
 # Generous but FINITE bound on git fetch/push below — every curl call here
 # already carries its own --max-time/--connect-timeout. See docs/PLAYBOOK.md
 # §8b (same reasoning as bin/upgrade.sh's PULL_TIMEOUT/BACKUP_TIMEOUT/
@@ -63,34 +59,15 @@ set -a
 [ -f "$CONFIG_DIR/secrets.env" ] && . "$CONFIG_DIR/secrets.env"
 set +a
 
-TOKEN="${GITHUB_ISSUE_TOKEN:-}"
-if [ -z "$TOKEN" ]; then
-  echo "WARNING: GITHUB_ISSUE_TOKEN not set in secrets.env — issue notifications are disabled; would-be issues are only logged below. This does NOT block the patch auto-upgrade path itself (docs/PLAYBOOK.md §8b)." >&2
-fi
-
-# ---- GitHub REST API ---------------------------------------------------
-# Token (when set) goes to curl via `-K -` on stdin, never argv — same
-# convention as bin/smoke.sh / bin/restore-db.sh --drill-full.
+# ---- GitHub release lookup (anonymous, read-only) ------------------------
 GH_API_STATUS=""
 GH_API_BODY=""
-gh_api() {  # gh_api <method> <path> [body-file]
-  local method="$1" path="$2" bodyfile="${3:-}" cfg out
-  cfg='header = "Accept: application/vnd.github+json"
-header = "X-GitHub-Api-Version: 2022-11-28"'
-  if [ -n "$TOKEN" ]; then
-    local esc
-    esc=$(printf '%s' "$TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')
-    cfg="$cfg
-header = \"Authorization: Bearer $esc\""
-  fi
-  if [ -n "$bodyfile" ]; then
-    out="$(printf '%s\n' "$cfg" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -K - \
-      -X "$method" -H 'Content-Type: application/json' --data-binary "@$bodyfile" \
-      "https://api.github.com$path")"
-  else
-    out="$(printf '%s\n' "$cfg" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -K - \
-      -X "$method" "https://api.github.com$path")"
-  fi
+gh_api() {  # gh_api <path>
+  local out
+  out="$(curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2022-11-28' \
+    "https://api.github.com$1")"
   GH_API_STATUS="${out##*$'\n'}"
   GH_API_BODY="${out%$'\n'*}"
 }
@@ -153,99 +130,36 @@ git_ready_for_autoupgrade() {
   fi
 }
 
-# ---- best-effort secret redaction for a log tail posted to an issue -----
-redact_log() {  # redact_log <file>
-  local f="$1" v script=""
-  for v in "${HINDSIGHT_DB_PASSWORD:-}" "${HINDSIGHT_API_TENANT_API_KEY:-}" "${HINDSIGHT_CP_ACCESS_KEY:-}" \
-           "${HINDSIGHT_API_LLM_API_KEY:-}" "${RCLONE_CONFIG_R2_ACCESS_KEY_ID:-}" \
-           "${RCLONE_CONFIG_R2_SECRET_ACCESS_KEY:-}" "${TOKEN:-}"; do
-    [ -n "$v" ] || continue
-    script="${script}s/$(printf '%s' "$v" | sed -e 's/[.[\^$*/\\]/\\&/g')/[REDACTED]/g;"
-  done
-  if [ -n "$script" ]; then sed "$script" "$f"; else cat "$f"; fi
-}
-
-# ---- issue dedupe + creation --------------------------------------------
-# Every API error here (label create other than "already exists", issue
-# listing, issue creation) is a hard failure: returns 1, and callers must
-# propagate that as a non-zero exit — never silently continue, and never
-# create an issue after a failed dedupe lookup (that lookup is the only
-# thing standing between this and spamming a duplicate).
-ensure_label() {  # returns 0 if the label exists (created now or already), 1 on any other API error
-  local bodyfile
-  bodyfile="$(mktemp)"
-  json_label_payload "$LABEL" "5319e7" "Opened/updated by bin/check-upstream.sh" > "$bodyfile"
-  gh_api POST "/repos/$ISSUE_REPO/labels" "$bodyfile"
-  rm -f "$bodyfile"
-  case "$GH_API_STATUS" in
-    201) return 0 ;;
-    422)
-      # Only a REAL "already exists" 422 (errors[].code == "already_exists")
-      # is harmless — GitHub returns 422 for other validation failures too
-      # (e.g. a bad color/name), and treating every 422 as "fine, it already
-      # exists" would silently swallow those instead of failing loud.
-      if printf '%s' "$GH_API_BODY" | json_has_error_code already_exists; then
-        return 0
-      fi
-      echo "ERROR: label create for '$LABEL' returned 422 but not 'already_exists' (HTTP 422): $GH_API_BODY" >&2
-      return 1
-      ;;
-    *) echo "ERROR: could not ensure label '$LABEL' exists (HTTP $GH_API_STATUS): $GH_API_BODY" >&2; return 1 ;;
-  esac
-}
-
-# find_issue_by_title <title> -> echoes the issue number if a match is
-# found (any state — open OR closed, so a previously-closed notification
-# is never recreated either), prints nothing if genuinely not found,
-# returns 1 only on an actual API error. Paginates (per_page=100) until a
-# page comes back with 0 items.
-find_issue_by_title() {
-  local title="$1" page=1 len num
-  while :; do
-    gh_api GET "/repos/$ISSUE_REPO/issues?state=all&labels=$LABEL&per_page=100&page=$page"
-    if [ "$GH_API_STATUS" != 200 ]; then
-      echo "ERROR: listing '$LABEL' issues (page $page) failed (HTTP $GH_API_STATUS): $GH_API_BODY" >&2
-      return 1
-    fi
-    len="$(printf '%s' "$GH_API_BODY" | json_array_len)" || {
-      echo "ERROR: listing '$LABEL' issues (page $page) returned HTTP 200 but a malformed/non-array body: $GH_API_BODY" >&2
-      return 1
-    }
-    [ "$len" -gt 0 ] || break
-    num="$(printf '%s' "$GH_API_BODY" | json_array_find_number title "$title")"
-    if [ -n "$num" ]; then
-      printf '%s\n' "$num"
-      return 0
-    fi
-    [ "$len" -eq 100 ] || break
-    page=$((page + 1))
-  done
-}
-
-open_or_dedupe_issue() {  # open_or_dedupe_issue <title> <body> -- 0 if ensured (existing or created), 1 on any API error
-  local title="$1" body="$2" existing bodyfile
-  if [ -z "$TOKEN" ]; then
-    echo "NOTE: GITHUB_ISSUE_TOKEN not set — would open/ensure issue titled: $title" >&2
-    printf '%s\n' "$body" >&2
+# Send the message via stdin so neither its contents nor any secret can
+# appear in argv. Failure is visible in the journal; callers handling an
+# upgrade outcome preserve that outcome's exit code and never roll back.
+notify() {  # notify <level> <title> <body>
+  local level="$1" title="$2" body="$3"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '[dry-run] would notify (%s): %s\n%s\n' "$level" "$title" "$body"
     return 0
   fi
-  ensure_label || return 1
-  existing="$(find_issue_by_title "$title")" || return 1
-  if [ -n "$existing" ]; then
-    echo "issue #$existing already exists (any state) with this exact title — not creating a duplicate: $title"
+  if [ ! -x "$OPS_NOTIFY_BIN" ] ||
+     ! printf '%s\n' "$body" | "$OPS_NOTIFY_BIN" --stdin --level "$level" --stack hindsight --title "$title"; then
+    printf 'ERROR: ops-notify failed for: %s\n%s\n' "$title" "$body" >&2
+    return 1
+  fi
+}
+
+notify_release_once() {  # notify_release_once <kind> <version> <title> <body>
+  local kind="$1" version="$2" title="$3" body="$4"
+  if [ -f "$NOTIFIED_STATE" ] && grep -Fxq "$kind $version" "$NOTIFIED_STATE"; then
+    echo "already notified: $kind $version"
     return 0
   fi
-  bodyfile="$(mktemp)"
-  json_issue_payload "$title" "$body" "$LABEL" > "$bodyfile"
-  gh_api POST "/repos/$ISSUE_REPO/issues" "$bodyfile"
-  rm -f "$bodyfile"
-  if [ "$GH_API_STATUS" = 201 ]; then
-    echo "opened issue: $title"
-    return 0
-  fi
-  echo "ERROR: creating issue failed (HTTP $GH_API_STATUS): $title" >&2
-  echo "$GH_API_BODY" >&2
-  return 1
+  notify info "$title" "$body" || return 1
+  if [ "$DRY_RUN" = 1 ]; then return 0; fi
+  ( umask 077
+    mkdir -p "$(dirname "$NOTIFIED_STATE")"
+    touch "$NOTIFIED_STATE"
+    chmod 600 "$NOTIFIED_STATE"
+    printf '%s %s\n' "$kind" "$version" >> "$NOTIFIED_STATE"
+  )
 }
 
 # ============================================================================
@@ -256,7 +170,7 @@ CUR="$(env_get "$CONFIG_DIR/version.env" HINDSIGHT_VERSION)"
 [ -n "$CUR" ] || { echo "ERROR: missing HINDSIGHT_VERSION in $CONFIG_DIR/version.env" >&2; exit 1; }
 
 say "Fetching latest stable release: $UPSTREAM_REPO"
-gh_api GET "/repos/$UPSTREAM_REPO/releases/latest"
+gh_api "/repos/$UPSTREAM_REPO/releases/latest"
 case "$GH_API_STATUS" in
   200) ;;
   403) echo "ERROR: GitHub API rate-limited (403) fetching $UPSTREAM_REPO release info." >&2; exit 1 ;;
@@ -313,10 +227,10 @@ if [ "$cmp" = patch ]; then
 
   if [ "$DRY_RUN" = 1 ]; then
     echo "[dry-run] would run: bin/upgrade.sh --yes --auto-rollback --smoke $ver"
-    echo "[dry-run] on success: commit+push server-setup/version.env, open issue 'Hindsight auto-upgraded to $ver'"
-    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' (pre-upgrade dump taken), '...failed before changing anything (restarted OK)' (stopped, no dump), or '...not applied; old version verified running' (image pull failed, stack untouched)"
-    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3): open the matching '...manual action needed' issue instead (rollback failed / restart not verified / untouched old version not verified)"
-    echo "[dry-run] after a healthy upgrade: if git commit fails, open 'Hindsight auto-upgraded to $ver but version.env commit failed'; if only the push fails, open '...but version.env push failed'"
+    echo "[dry-run] on success: commit+push server-setup/version.env, send notification 'Hindsight auto-upgraded to $ver'"
+    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): notify 'Hindsight auto-upgrade to $ver failed (rolled back)' (pre-upgrade dump taken), '...failed before changing anything (restarted OK)' (stopped, no dump), or '...not applied; old version verified running' (image pull failed, stack untouched)"
+    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3): send the matching '...manual action needed' error notification instead (rollback failed / restart not verified / untouched old version not verified)"
+    echo "[dry-run] after a healthy upgrade: if git commit fails, notify 'Hindsight auto-upgraded to $ver but version.env commit failed'; if only the push fails, notify '...but version.env push failed'"
     exit 0
   fi
 
@@ -327,7 +241,7 @@ Release: $html_url
 
 Manual upgrade (after fixing the repo state above), run on the server from server-setup/:
   bin/upgrade.sh $ver"
-    open_or_dedupe_issue "Hindsight $ver available but auto-upgrade blocked (repo not clean)" "$body" || true
+    notify warn "Hindsight $ver available but auto-upgrade blocked (repo not clean)" "$body" || true
     exit 1
   fi
 
@@ -367,7 +281,7 @@ Release: $html_url
 
 $notes_excerpt"
         rm -f "$LOG"
-        if open_or_dedupe_issue "Hindsight auto-upgraded to $ver" "$body"; then exit 0; else exit 1; fi
+        if notify info "Hindsight auto-upgraded to $ver" "$body"; then exit 0; else exit 1; fi
       elif [ "$commit_ok" = 0 ]; then
         # Upgrade itself is healthy and running $ver — only the repo update
         # failed, and failed before any commit was even made. Nothing to
@@ -385,7 +299,7 @@ Fix manually on the server:
 
 Release: $html_url"
         rm -f "$LOG"
-        open_or_dedupe_issue "Hindsight auto-upgraded to $ver but version.env commit failed" "$body" || true
+        notify warn "Hindsight auto-upgraded to $ver but version.env commit failed" "$body" || true
         exit 1
       else
         # commit_ok=1, push_ok=0: the LOCAL commit above already landed —
@@ -403,7 +317,7 @@ Fix manually on the server:
 
 Release: $html_url"
         rm -f "$LOG"
-        open_or_dedupe_issue "Hindsight auto-upgraded to $ver but version.env push failed" "$body" || true
+        notify warn "Hindsight auto-upgraded to $ver but version.env push failed" "$body" || true
         exit 1
       fi
       ;;
@@ -429,14 +343,13 @@ Release: $html_url"
       # on this same grep).
       pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')" || true
       if [ -n "$pre_dump" ]; then
-        echo "upgrade.sh failed but auto-rollback succeeded and was VERIFIED (back on $CUR) — see the log tail in the issue being opened now." >&2
+        echo "upgrade.sh failed but auto-rollback succeeded and was VERIFIED (back on $CUR) — see the outcome in the journal." >&2
         title="Hindsight auto-upgrade to $ver failed (rolled back)"
         body="Automatic upgrade of Hindsight $CUR -> $ver FAILED and was automatically rolled back to $CUR by bin/upgrade.sh --auto-rollback — VERIFIED back on $CUR and healthy (version.env pin + the running container's image + /health all checked). version.env was NOT changed; nothing was committed or pushed.
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       elif grep -q "RECOVERY_KIND: untouched" "$LOG"; then
         echo "upgrade.sh failed before anything was touched (the image pull itself failed) — hindsight was never stopped, just confirmed still healthy on $CUR." >&2
         title="Hindsight auto-upgrade to $ver not applied; old version verified running"
@@ -444,8 +357,7 @@ $(redact_log "$LOG" | tail -n 100)"
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       else
         echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was stopped (or a stop was attempted) and has been restarted and VERIFIED healthy on $CUR." >&2
         title="Hindsight auto-upgrade to $ver failed before changing anything (restarted OK)"
@@ -453,11 +365,10 @@ $(redact_log "$LOG" | tail -n 100)"
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       fi
       rm -f "$LOG"
-      open_or_dedupe_issue "$title" "$body" || true
+      notify warn "$title" "$body" || true
       exit 1
       ;;
     *)
@@ -484,8 +395,7 @@ Manual restore (docs/PLAYBOOK.md §6/§8), run on the server from server-setup/:
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       elif grep -q "RECOVERY_KIND: untouched" "$LOG"; then
         title="Hindsight auto-upgrade to $ver not applied; old version could not be verified — manual action needed"
         body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before hindsight was ever stopped (the image pull itself failed) — the upgrade was never applied, but bin/upgrade.sh could NOT verify hindsight is still healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check manually:
@@ -496,8 +406,7 @@ $(redact_log "$LOG" | tail -n 100)"
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       else
         title="Hindsight auto-upgrade to $ver failed before changing anything AND the restart could not be verified — manual action needed"
         body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (hindsight was stopped, or a stop was attempted), and bin/upgrade.sh could NOT verify hindsight is healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check and restart manually:
@@ -509,11 +418,10 @@ $(redact_log "$LOG" | tail -n 100)"
 
 Release: $html_url
 
---- log tail (secrets redacted) ---
-$(redact_log "$LOG" | tail -n 100)"
+See journalctl --user -u hindsight-upgrade-check for this outcome."
       fi
       rm -f "$LOG"
-      open_or_dedupe_issue "$title" "$body" || true
+      notify error "$title" "$body" || true
       exit 1
       ;;
   esac
@@ -522,7 +430,7 @@ fi
 # ---- minor/major: report only, never applied automatically --------------
 say "$cmp release available: $CUR -> $ver (manual upgrade only)"
 if [ "$DRY_RUN" = 1 ]; then
-  echo "[dry-run] would open issue 'Hindsight $ver available (manual upgrade)' — no upgrade run, no git changes."
+  echo "[dry-run] would send notification 'Hindsight $ver available (manual upgrade)' — no upgrade run, no git changes."
   exit 0
 fi
 body="A new $cmp release of Hindsight is available: $CUR -> $ver. This is NOT applied automatically — only PATCH bumps (same MAJOR.MINOR) are.
@@ -533,4 +441,4 @@ $notes_excerpt
 
 Manual upgrade, run on the server from server-setup/:
   bin/upgrade.sh $ver"
-if open_or_dedupe_issue "Hindsight $ver available (manual upgrade)" "$body"; then exit 0; else exit 1; fi
+if notify_release_once "$cmp" "$ver" "Hindsight $ver available (manual upgrade)" "$body"; then exit 0; else exit 1; fi

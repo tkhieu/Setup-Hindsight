@@ -86,6 +86,8 @@ n=0
 while [ ! -e "$PAUSE_DIR/reached" ] && [ "$n" -lt 200 ]; do sleep 0.1; n=$((n + 1)); done
 [ -e "$PAUSE_DIR/reached" ] || { : > "$PAUSE_DIR/go"; wait "$pid" || true; cat "$TMP/out2"; echo "FAIL: reembed never reached hs stop"; exit 1; }
 grep -q '^backup held=1$' "$CALLS" || { : > "$PAUSE_DIR/go"; wait "$pid" || true; echo "FAIL: nested backup did not run under the held lock"; cat "$CALLS"; exit 1; }
+# positional parameter is expanded by child bash
+# shellcheck disable=SC2016
 if env -u HINDSIGHT_OPS_LOCK_HELD HINDSIGHT_OPS_LOCK_TIMEOUT=1 bash -c '. "$1/bin/lib/lock.sh"; acquire_ops_lock "$1"' _ "$TMP" 2>"$TMP/lockerr"; then
   : > "$PAUSE_DIR/go"; wait "$pid" || true
   echo "FAIL: a concurrent acquire_ops_lock succeeded while reembed.sh --yes was mid-run"; exit 1
@@ -95,6 +97,8 @@ grep -q 'could not acquire' "$TMP/lockerr" || { : > "$PAUSE_DIR/go"; wait "$pid"
 wait "$pid" || { cat "$TMP/out2"; echo "FAIL: paused reembed run did not finish successfully"; exit 1; }
 grep -q 'verified 1 bank' "$TMP/out2"
 # Released on exit: the lock is free again.
+# positional parameter is expanded by child bash
+# shellcheck disable=SC2016
 env -u HINDSIGHT_OPS_LOCK_HELD HINDSIGHT_OPS_LOCK_TIMEOUT=1 bash -c '. "$1/bin/lib/lock.sh"; acquire_ops_lock "$1"' _ "$TMP" \
   || { echo "FAIL: lock not released after reembed.sh exited"; exit 1; }
 echo ok
