@@ -658,7 +658,7 @@ dựa vào systemd:
 | `docker image pull` (`upgrade.sh`, bước 2/7) | `HINDSIGHT_PULL_TIMEOUT` | 600s |
 | `bin/backup.sh`/`bin/backup-r2.sh` (`upgrade.sh`, bước 4/4b) | `HINDSIGHT_BACKUP_TIMEOUT` | 900s |
 | `bin/restore-db.sh` trong auto-rollback (`upgrade.sh`) | `HINDSIGHT_RESTORE_TIMEOUT` | 900s |
-| `hs stop`/`hs up -d`/`hs ps` (mọi nơi trong `upgrade.sh`, kể cả stop/recovery/verify) | `HINDSIGHT_HS_TIMEOUT` | 120s — gần như lúc nào cũng tức thì, chỉ đề phòng docker daemon đứng |
+| `hs stop`/`hs up -d`/`hs ps` (mọi nơi trong `upgrade.sh`, kể cả stop/recovery/verify) | `HINDSIGHT_HS_TIMEOUT` | 120s — gồm 75s grace để Hindsight 1.2.0 drain trên SIGTERM, còn dư 45s cho daemon |
 | `bin/hs ready` (nội bộ, chính nó) | `HINDSIGHT_READY_TIMEOUT` | 60s (300s ở bước 7/7 lúc upgrade) — vòng lặp curl bên trong `bin/hs` |
 | `bin/hs ready` (bọc ngoài, chặn hang TRƯỚC khi vòng lặp trên kịp chạy — ví dụ `docker compose port` đứng) | `HINDSIGHT_READY_OUTER_MARGIN` (cộng thêm vào `HINDSIGHT_HS_TIMEOUT`/budget phía trên) | +30s |
 | `bin/smoke.sh` (bước `--smoke` sau khi lên version mới; timeout = smoke FAIL -> auto-rollback + tin Telegram) | `HINDSIGHT_SMOKE_TIMEOUT` | 600s — bao cả `hs url` lẫn mọi curl bên trong; quá hạn thì TERM, thêm 30s mà chưa thoát thì KILL |
