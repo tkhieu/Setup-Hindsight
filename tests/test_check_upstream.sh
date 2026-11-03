@@ -56,7 +56,17 @@ case "$url" in
   *"ghcr.io/token"*)
     printf '{"token":"fake-ghcr-token"}' ;;
   *"ghcr.io/v2/"*"/manifests/"*)
-    printf '%s' "${GHCR_STATUS:-200}" ;;
+    # GHCR_OK_TAGS (space-separated) -> only those tags exist (200), every
+    # other tag 404s; unset -> every tag answers ${GHCR_STATUS:-200}.
+    if [ -n "${GHCR_OK_TAGS+x}" ]; then
+      tag="${url##*/manifests/}"
+      case " $GHCR_OK_TAGS " in
+        *" $tag "*) printf 200 ;;
+        *) printf 404 ;;
+      esac
+    else
+      printf '%s' "${GHCR_STATUS:-200}"
+    fi ;;
   *"api.github.com/repos/vectorize-io/hindsight/releases/latest")
     printf '%s\n%s' "${RELEASE_BODY:-}" "${RELEASE_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/labels")
@@ -209,6 +219,35 @@ grep -q "/issues " "$T6/CURL_ARGV_LOG" && { echo "FAIL: --dry-run made an issues
 [ -e "$T6/.ops.lock" ] && { echo "FAIL: --dry-run created the shared lock file (must skip locking entirely)"; exit 1; }
 rm -rf "$T6"
 echo "ok - --dry-run makes no upgrade/issue/git calls and creates no files at all"
+
+# ============================================================================
+# Scenario: GHCR check uses the tag compose will PULL (version + image
+# suffix, default "-slim"): only 1.1.1-slim published, bare 1.1.1 absent
+# -> check passes. Then with HINDSIGHT_IMAGE_SUFFIX= (empty = full image)
+# in version.env, the same registry state must FAIL (bare tag missing).
+# ============================================================================
+T6S="$(mktemp -d)"
+setup_minimal "$T6S" 1.1.0
+printf 'HINDSIGHT_IMAGE_SUFFIX=-slim\n' >> "$T6S/version.env"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY GHCR_OK_TAGS="1.1.1-slim"
+out6s="$(run_minimal "$T6S" --dry-run 2>&1)" || { echo "$out6s"; echo "FAIL: slim tag present must pass the GHCR check"; exit 1; }
+grep -q "/manifests/1.1.1-slim\$" "$T6S/CURL_ARGV_LOG" || { cat "$T6S/CURL_ARGV_LOG"; echo "FAIL: expected a manifest check for 1.1.1-slim"; exit 1; }
+printf '%s\n' "$out6s" | grep -q '\[dry-run\] would run' || { echo "$out6s"; echo "FAIL: expected to reach the patch path"; exit 1; }
+# Suffix UNSET in version.env -> compose's default "-slim" applies too.
+setup_minimal "$T6S" 1.1.0
+out6u="$(run_minimal "$T6S" --dry-run 2>&1)" || { echo "$out6u"; echo "FAIL: unset suffix must default to -slim like compose"; exit 1; }
+# Suffix set EMPTY -> full image -> bare 1.1.1 is what would be pulled, and it is absent.
+printf 'HINDSIGHT_IMAGE_SUFFIX=\n' >> "$T6S/version.env"
+set +e
+out6e="$(run_minimal "$T6S" --dry-run 2>&1)"
+rc6e=$?
+set -e
+[ "$rc6e" -ne 0 ] || { echo "$out6e"; echo "FAIL: empty suffix (full image) with only the slim tag published must fail the GHCR check"; exit 1; }
+printf '%s\n' "$out6e" | grep -q "hindsight:1.1.1 not found" || { echo "$out6e"; echo "FAIL: expected 'hindsight:1.1.1 not found'"; exit 1; }
+unset RELEASE_BODY GHCR_OK_TAGS
+rm -rf "$T6S"
+echo "ok - GHCR check targets version+suffix (slim default, empty = full image)"
 
 # ============================================================================
 # Scenario: GITHUB_ISSUE_TOKEN is never put in curl's argv.

@@ -35,9 +35,10 @@
 #                   before that point behaves exactly as it always has
 #                   (restart-if-stopped, or a bare exit 1 if the pull itself
 #                   failed — no verification, no extra noise either way).
-# --smoke           after /health is ready, also run bin/smoke.sh. A smoke
-#                   failure is treated the same as a failed /health wait
-#                   (triggers --auto-rollback if given).
+# --smoke           after /health is ready, also run bin/smoke.sh, bounded
+#                   by $HINDSIGHT_SMOKE_TIMEOUT (default 600s). A smoke
+#                   failure OR timeout is treated the same as a failed
+#                   /health wait (triggers --auto-rollback if given).
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -71,6 +72,11 @@ HS_TIMEOUT="${HINDSIGHT_HS_TIMEOUT:-120}"           # hs stop/up -d/ps — norma
 # of where it got stuck, so this only needs to be "bigger than the inner
 # budget", not an exact match.
 READY_OUTER_MARGIN="${HINDSIGHT_READY_OUTER_MARGIN:-30}"
+# Whole bin/smoke.sh run (--smoke): create bank + LLM-backed retain + recall
+# + cleanup. Its own curl calls carry --max-time 30 each, but `hs url`
+# (docker compose port) does not, and the total is unbounded without this.
+# A smoke timeout is a smoke FAILURE (-> auto-rollback path + issue).
+SMOKE_TIMEOUT="${HINDSIGHT_SMOKE_TIMEOUT:-600}"
 
 YES=0
 AUTO_ROLLBACK=0
@@ -174,17 +180,31 @@ TXT
 # real /health check. All three must agree; printing "OK" on the strength
 # of a command merely exiting 0 is exactly how this used to lie.
 verify_on_version() {
-  local expected="$1" env_ver image
+  local expected="$1" env_ver image ps_out ps_rc suffix
   env_ver="$(env_get "$CONFIG_DIR/version.env" HINDSIGHT_VERSION)"
   if [ "$env_ver" != "$expected" ]; then
     echo "ERROR: version.env pins '$env_ver', expected '$expected'." >&2
     return 1
   fi
-  image="$(timeout "$HS_TIMEOUT" "$HS" ps --format '{{.Image}}' hindsight 2>/dev/null | tail -n1)"
+  # The tag compose actually runs is version + image suffix (default
+  # "-slim", empty = full image) — see image_suffix in bin/lib/env.sh.
+  suffix="$(image_suffix "$CONFIG_DIR/version.env")"
+  # Captured with its OWN exit status (not piped into tail inside a
+  # conditional, where the pipeline status would be tail's): a timed-out or
+  # failed `hs ps` FAILS verification even if it printed a matching image
+  # line before dying — partial output from a command that did not finish
+  # is not evidence.
+  ps_rc=0
+  ps_out="$(timeout "$HS_TIMEOUT" "$HS" ps --format '{{.Image}}' hindsight 2>/dev/null)" || ps_rc=$?
+  if [ "$ps_rc" -ne 0 ]; then
+    echo "ERROR: 'hs ps' failed (exit $ps_rc; 124 = exceeded ${HS_TIMEOUT}s) — cannot verify the running image." >&2
+    return 1
+  fi
+  image="$(printf '%s\n' "$ps_out" | tail -n1)"
   case "$image" in
-    *":$expected") ;;
+    *":${expected}${suffix}") ;;
     *)
-      echo "ERROR: running hindsight container's image is '${image:-<none>}', expected a tag ending ':$expected'." >&2
+      echo "ERROR: running hindsight container's image is '${image:-<none>}', expected a tag ending ':${expected}${suffix}'." >&2
       return 1
       ;;
   esac
@@ -357,8 +377,11 @@ fi
 
 if [ "$SMOKE" = 1 ]; then
   say "7b/7 Smoke test"
-  if ! "$CONFIG_DIR/bin/smoke.sh"; then
-    echo "Smoke test failed after upgrading to $NEW." >&2
+  # -k 30: if smoke.sh ignores the TERM (e.g. stuck in its cleanup trap),
+  # KILL it 30s later — the timeout itself must be final. timeout signals
+  # its whole process group, so smoke.sh's `hs url`/curl children go too.
+  if ! timeout -k 30 "$SMOKE_TIMEOUT" "$CONFIG_DIR/bin/smoke.sh"; then
+    echo "Smoke test failed (or exceeded ${SMOKE_TIMEOUT}s) after upgrading to $NEW." >&2
     exit 1
   fi
 fi

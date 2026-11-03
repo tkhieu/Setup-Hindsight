@@ -149,7 +149,7 @@ case "\$1" in
       # verify_on_version's image check: report whatever version.env
       # currently pins, same as a real running container would after a
       # real \`hs up -d\` against that env file.
-      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TB/version.env" | cut -d= -f2)" ;;
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TB/version.env" | cut -d= -f2)-slim" ;;
       *) ;;  # --services --status running -> nothing running (stop verified)
     esac
     exit 0 ;;
@@ -371,7 +371,7 @@ case "\$1" in
   ps)
     shift
     case "\$*" in
-      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TE2/version.env" | cut -d= -f2)" ;;
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TE2/version.env" | cut -d= -f2)-slim" ;;
       *) ;;
     esac
     exit 0 ;;
@@ -418,7 +418,7 @@ case "\$1" in
   ps)
     shift
     case "\$*" in
-      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TF/version.env" | cut -d= -f2)" ;;
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TF/version.env" | cut -d= -f2)-slim" ;;
       *) ;;
     esac
     exit 0 ;;
@@ -542,7 +542,7 @@ case "\$1" in
   ps)
     shift
     case "\$*" in
-      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TH/version.env" | cut -d= -f2)" ;;
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TH/version.env" | cut -d= -f2)-slim" ;;
       *) ;;
     esac
     exit 0 ;;
@@ -572,3 +572,117 @@ printf '%s\n' "$outH" | grep -qi "RECOVERY_KIND: restarted" \
 
 rm -rf "$TH"
 echo "ok - a stalled initial 'hs stop' is treated as touched (restart+verify attempted), not 'nothing touched'"
+
+# ============================================================================
+# Scenario I: recovery verification compares against version + image
+# suffix (compose's `${HINDSIGHT_IMAGE_SUFFIX--slim}`). Pull failure in auto
+# mode with `...:1.1.0-slim` running -> exit 2; the same run with the BARE
+# `...:1.1.0` running (wrong variant for this stack) -> exit 3.
+# ============================================================================
+TI="$(mktemp -d)"
+setup_common "$TI"
+printf 'HINDSIGHT_IMAGE_SUFFIX=-slim\n' >> "$TI/version.env"
+cat > "$TI/bin/hs" <<EOF
+#!/bin/sh
+case "\$1" in
+  pull) exit 1 ;;
+  ps) echo "ghcr.io/vectorize-io/hindsight:\$(cat "$TI/running_tag")"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TI/bin/hs"
+cd "$TI"
+echo "1.1.0-slim" > "$TI/running_tag"
+set +e
+outI1="$(PATH="$TI/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"; rcI1=$?
+echo "1.1.0" > "$TI/running_tag"
+outI2="$(PATH="$TI/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"; rcI2=$?
+set -e
+cd "$HERE"
+[ "$rcI1" -eq 2 ] || { echo "$outI1"; echo "FAIL: expected exit 2 with 1.1.0-slim running, got $rcI1"; exit 1; }
+[ "$rcI2" -eq 3 ] || { echo "$outI2"; echo "FAIL: expected exit 3 with bare 1.1.0 running (suffix -slim expected), got $rcI2"; exit 1; }
+printf '%s\n' "$outI2" | grep -q "expected a tag ending ':1.1.0-slim'" || { echo "$outI2"; echo "FAIL: missing suffix-aware mismatch error"; exit 1; }
+rm -rf "$TI"
+echo "ok - recovery verify expects ':<ver><suffix>' (1.1.0-slim -> 2, bare 1.1.0 -> 3)"
+
+# ============================================================================
+# Scenario J: `hs ps` prints the EXPECTED image, then hangs past
+# HINDSIGHT_HS_TIMEOUT. Partial output from a timed-out command is not
+# evidence -> verification must FAIL -> exit 3.
+# ============================================================================
+TJ="$(mktemp -d)"
+setup_common "$TJ"
+cat > "$TJ/bin/hs" <<EOF
+#!/bin/sh
+case "\$1" in
+  pull) exit 1 ;;
+  ps) echo "ghcr.io/vectorize-io/hindsight:1.1.0-slim"; sleep 30; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TJ/bin/hs"
+cd "$TJ"
+set +e
+START_J="$(date +%s)"
+outJ="$(PATH="$TJ/bin:$PATH" HINDSIGHT_HS_TIMEOUT=2 ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"; rcJ=$?
+END_J="$(date +%s)"
+set -e
+cd "$HERE"
+[ "$rcJ" -eq 3 ] || { echo "$outJ"; echo "FAIL: expected exit 3 when 'hs ps' times out after printing the expected image, got $rcJ"; exit 1; }
+[ $((END_J - START_J)) -le 20 ] || { echo "FAIL: hung 'hs ps' not bounded ($((END_J - START_J))s)"; exit 1; }
+printf '%s\n' "$outJ" | grep -q "'hs ps' failed (exit 124" || { echo "$outJ"; echo "FAIL: missing the hs-ps-timeout error"; exit 1; }
+rm -rf "$TJ"
+echo "ok - a timed-out 'hs ps' fails verification even after printing the expected image (exit 3)"
+
+# ============================================================================
+# Scenario K: --smoke where bin/smoke.sh HANGS. Must be bounded by
+# HINDSIGHT_SMOKE_TIMEOUT, treated as a smoke failure, and go through the
+# auto-rollback path (restore the pre-upgrade dump, revert version.env) ->
+# exit 2 once the rollback is verified.
+# ============================================================================
+TK="$(mktemp -d)"
+setup_common "$TK"
+RESTORE_LOG_K="$TK/restore.log"
+: > "$RESTORE_LOG_K"
+cat > "$TK/bin/smoke.sh" <<'EOF'
+#!/bin/sh
+sleep 60
+EOF
+cat > "$TK/bin/restore-db.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$RESTORE_LOG_K"
+exit 0
+EOF
+chmod +x "$TK/bin/smoke.sh" "$TK/bin/restore-db.sh"
+cat > "$TK/bin/hs" <<EOF
+#!/bin/sh
+case "\$1" in
+  ps)
+    shift
+    case "\$*" in
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TK/version.env" | cut -d= -f2)-slim" ;;
+    esac
+    exit 0 ;;
+  exec)
+    shift
+    case "\$*" in *pg_dump*) cat "$TK/fixture.sql" ;; esac
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TK/bin/hs"
+cd "$TK"
+set +e
+START_K="$(date +%s)"
+outK="$(PATH="$TK/bin:$PATH" HINDSIGHT_SMOKE_TIMEOUT=2 ./bin/upgrade.sh --yes --auto-rollback --smoke 1.1.1 </dev/null 2>&1)"; rcK=$?
+END_K="$(date +%s)"
+set -e
+cd "$HERE"
+[ "$rcK" -eq 2 ] || { echo "$outK"; echo "FAIL: expected exit 2 (rolled back) after a smoke timeout, got $rcK"; exit 1; }
+[ $((END_K - START_K)) -le 30 ] || { echo "FAIL: hung smoke.sh not bounded ($((END_K - START_K))s)"; exit 1; }
+printf '%s\n' "$outK" | grep -q "exceeded 2s" || { echo "$outK"; echo "FAIL: missing smoke-timeout message"; exit 1; }
+printf '%s\n' "$outK" | grep -q "AUTO-ROLLBACK OK" || { echo "$outK"; echo "FAIL: smoke timeout must take the auto-rollback path"; exit 1; }
+[ -s "$RESTORE_LOG_K" ] || { echo "FAIL: restore-db.sh was never called after the smoke timeout"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TK/version.env" || { echo "FAIL: version.env not reverted"; cat "$TK/version.env"; exit 1; }
+rm -rf "$TK"
+echo "ok - a hanging smoke.sh is bounded by HINDSIGHT_SMOKE_TIMEOUT and triggers the auto-rollback (exit 2)"
