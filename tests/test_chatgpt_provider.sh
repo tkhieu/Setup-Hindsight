@@ -24,6 +24,9 @@ case "$*" in
     shift 7
     HINDSIGHT_API_LLM_CHATGPT_HOME="$CHATGPT_TEST_HOME" sh -c "$1"
     ;;
+  *'run --rm hindsight hindsight-admin chatgpt status'*)
+    printf 'Plan usage enabled: no\nSigned in: no\n'
+    ;;
   *'hindsight-admin chatgpt status'*)
     [ "${STATUS_OK:-0}" = 1 ] || exit 1
     printf 'Plan usage enabled: yes\nSigned in: yes\n'
@@ -51,13 +54,26 @@ grep -q 'compose.*up -d' "$CALLS"
 grep -q 'run --rm -T --no-deps hindsight hindsight-admin chatgpt status' "$CALLS"
 
 STATUS_OK=0; export STATUS_OK
+: > "$CALLS"
+"$TMP/bin/hs" up -d db > "$TMP/out" 2> "$TMP/err"
+grep -q 'up -d db' "$CALLS"
+if grep -q 'hindsight-admin chatgpt status' "$CALLS"; then exit 1; fi
+"$TMP/bin/hs" run --rm db echo hindsight > "$TMP/out" 2> "$TMP/err"
+"$TMP/bin/hs" run --rm hindsight hindsight-admin chatgpt status > "$TMP/out" 2> "$TMP/err"
+"$TMP/bin/hs" run --rm hindsight hindsight-admin chatgpt login --from-file /fake > "$TMP/out" 2> "$TMP/err"
+grep -q 'run --rm hindsight hindsight-admin chatgpt status' "$CALLS"
+grep -q 'run --rm hindsight hindsight-admin chatgpt login --from-file /fake' "$CALLS"
+
 if "$TMP/bin/hs" up -d > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
+grep -q 'bin/chatgpt-login.sh' "$TMP/err"
+if "$TMP/bin/hs" up -d hindsight > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
 grep -q 'bin/chatgpt-login.sh' "$TMP/err"
 if "$TMP/bin/bootstrap.sh" > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
 grep -q 'bin/chatgpt-login.sh' "$TMP/err"
 if grep -q 'HINDSIGHT_API_LLM_API_KEY' "$TMP/err"; then exit 1; fi
 
 printf 'HINDSIGHT_API_LLM_PROVIDER=openai\n' > "$TMP/base.env"
+"$TMP/bin/hs" up -d db > "$TMP/out" 2> "$TMP/err"
 if "$TMP/bin/hs" up -d > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
 grep -q 'HINDSIGHT_API_LLM_API_KEY' "$TMP/err"
 

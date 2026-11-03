@@ -3,7 +3,9 @@
 # needs — attachments use the "native" file storage backend (PostgreSQL
 # BYTEA, confirmed as the default in hindsight_api/config.py), so there is no
 # separate uploads/artifacts volume to back up. The hf_cache volume holds
-# only re-downloadable model weights and is never backed up either.
+# only re-downloadable model weights and is never backed up either. The
+# chatgpt_credentials volume is excluded from unencrypted backups; re-login
+# after server loss (docs/PLAYBOOK.md §4.2).
 #
 # Usage: bin/backup.sh [label]
 set -euo pipefail

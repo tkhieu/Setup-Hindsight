@@ -63,6 +63,8 @@ services:
     environment:
       HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in secrets.env}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
       HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-chatgpt}
+      # Optional for chatgpt; bin/hs enforces a nonempty key when starting
+      # hindsight with an API-key provider (Compose cannot guard conditionally).
       HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-}
       HINDSIGHT_API_LLM_CHATGPT_HOME: ${HINDSIGHT_API_LLM_CHATGPT_HOME:-/home/hindsight/.hindsight/chatgpt}
       # ApiKeyTenantExtension — confirmed in
