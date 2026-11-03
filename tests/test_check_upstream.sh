@@ -665,3 +665,61 @@ grep -qi "rolled back" "$CREATED_ISSUE_LOG_18" \
   && { echo "FAIL: nothing was ever bumped, so this issue must never say 'rolled back':"; cat "$CREATED_ISSUE_LOG_18"; exit 1; }
 rm -rf "$T18"
 echo "ok - upgrade.sh exit 2 with no pre-upgrade dump -> 'failed before changing anything (restarted OK)' issue"
+
+# ============================================================================
+# Scenario: patch available, upgrade succeeds, but the git COMMIT itself
+# fails (before any commit exists at all — distinct from T13's push
+# failure, where the commit already landed) -> a "...but version.env
+# commit failed" issue with instructions to fix git identity/hooks and
+# then add+commit+push, NOT the push-failed text. No rollback either way.
+# ============================================================================
+T19="$(mktemp -d)"
+setup_git "$T19" 1.1.0
+UPGRADE_LOG_19="$T19/upgrade.log"
+CREATED_ISSUE_LOG_19="$T19/created_issue.json"
+: > "$UPGRADE_LOG_19"
+: > "$CREATED_ISSUE_LOG_19"
+cat > "$T19/repo/server-setup/bin/upgrade.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$UPGRADE_LOG_19"
+sed -i 's|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=1.1.1|' "$T19/repo/server-setup/version.env"
+echo "fake upgrade.sh: ok"
+exit 0
+EOF
+chmod +x "$T19/repo/server-setup/bin/upgrade.sh"
+git -C "$T19/repo" add -A
+git -C "$T19/repo" commit -q -m "add fake upgrade.sh"
+git -C "$T19/repo" push -q origin main
+# Break ONLY the commit step: a pre-commit hook on the LOCAL repo that
+# rejects every commit (simulating a missing git identity or a rejecting
+# hook) — added AFTER the scaffolding commit above, so only the real
+# auto-upgrade commit inside check-upstream.sh is ever blocked.
+cat > "$T19/repo/.git/hooks/pre-commit" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected by pre-commit hook (simulated commit failure)" >&2
+exit 1
+HOOKEOF
+chmod +x "$T19/repo/.git/hooks/pre-commit"
+
+BEFORE_SHA_19="$(git -C "$T19/repo" rev-parse main)"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_19"
+set +e
+out19="$(run_git "$T19" 2>&1)"
+rc19=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG
+
+[ "$rc19" -ne 0 ] || { echo "$out19"; echo "FAIL: expected a non-zero exit when the commit fails"; exit 1; }
+[ "$(git -C "$T19/repo" rev-parse main)" = "$BEFORE_SHA_19" ] \
+  || { echo "FAIL: expected NO commit to land — the commit step itself failed"; exit 1; }
+grep -q '"title":"Hindsight auto-upgraded to 1.1.1 but version.env commit failed"' "$CREATED_ISSUE_LOG_19" \
+  || { echo "FAIL: missing the distinct commit-failed issue:"; cat "$CREATED_ISSUE_LOG_19"; exit 1; }
+printf '%s\n' "$out19" "$(cat "$CREATED_ISSUE_LOG_19")" | grep -qi "AUTO-ROLLBACK" \
+  && { echo "FAIL: a commit failure after a healthy upgrade must never mention a rollback"; exit 1; }
+grep -q "commit -m" "$CREATED_ISSUE_LOG_19" \
+  || { echo "FAIL: the commit-failed issue must instruct add+commit+push (there is no commit yet):"; cat "$CREATED_ISSUE_LOG_19"; exit 1; }
+grep -qi "git identity\|pre-commit" "$CREATED_ISSUE_LOG_19" \
+  || { echo "FAIL: expected a hint about git identity/hooks:"; cat "$CREATED_ISSUE_LOG_19"; exit 1; }
+rm -rf "$T19"
+echo "ok - git commit itself fails -> distinct 'version.env commit failed' issue, add+commit+push instructions, no rollback"

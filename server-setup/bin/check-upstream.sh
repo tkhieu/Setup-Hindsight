@@ -335,16 +335,26 @@ Manual upgrade (after fixing the repo state above), run on the server from serve
     0)
       cat "$LOG"
       say "Committing + pushing version.env"
-      push_ok=1
-      git -C "$REPO_ROOT" add server-setup/version.env || push_ok=0
-      if [ "$push_ok" = 1 ]; then
-        git -C "$REPO_ROOT" commit -m "chore: bump Hindsight to $ver" || push_ok=0
+      # commit_ok covers `add`+`commit` — a failure there means NO commit
+      # exists anywhere (local git identity not set, a pre-commit hook
+      # rejecting it, a dirty index, ...), so the fix is to actually make
+      # one. push_ok (only even attempted if commit_ok) covers the SEPARATE
+      # `push` step — a failure there means the commit already exists
+      # LOCALLY, so the fix is pull+push, NEVER a second commit. Conflating
+      # these two would tell the operator to commit again in the push-ok
+      # case, or to "just push" when there is nothing yet to push.
+      commit_ok=1
+      push_ok=0
+      git -C "$REPO_ROOT" add server-setup/version.env || commit_ok=0
+      if [ "$commit_ok" = 1 ]; then
+        git -C "$REPO_ROOT" commit -m "chore: bump Hindsight to $ver" || commit_ok=0
       fi
-      if [ "$push_ok" = 1 ]; then
+      if [ "$commit_ok" = 1 ]; then
+        push_ok=1
         timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" push origin main || push_ok=0
       fi
 
-      if [ "$push_ok" = 1 ]; then
+      if [ "$commit_ok" = 1 ] && [ "$push_ok" = 1 ]; then
         body="Hindsight was automatically upgraded from $CUR to $ver (patch release) and the smoke test passed.
 
 Release: $html_url
@@ -352,12 +362,30 @@ Release: $html_url
 $notes_excerpt"
         rm -f "$LOG"
         if open_or_dedupe_issue "Hindsight auto-upgraded to $ver" "$body"; then exit 0; else exit 1; fi
-      else
+      elif [ "$commit_ok" = 0 ]; then
         # Upgrade itself is healthy and running $ver — only the repo update
-        # failed. Nothing to roll back; this is a git problem, not a
-        # hindsight problem, so bin/upgrade.sh's own rollback is never
-        # involved here. The LOCAL commit above already landed (only the
-        # push failed) — the fix is pull+push, NEVER a second commit.
+        # failed, and failed before any commit was even made. Nothing to
+        # roll back; this is a git problem, not a hindsight problem, so
+        # bin/upgrade.sh's own rollback is never involved here.
+        echo "ERROR: commit of version.env failed after a successful upgrade to $ver — hindsight is healthy on $ver, but the repo on the server was never updated (no commit exists)." >&2
+        body="Hindsight was upgraded to $ver and passed its smoke test — it is healthy and running $ver right now. Committing version.env to $ver on the server afterward FAILED (before any commit was made) — likely a missing git identity (user.name/user.email) or a rejecting pre-commit/commit-msg hook. Nothing needs to be rolled back.
+
+Fix manually on the server:
+  git -C $REPO_ROOT status
+  git -C $REPO_ROOT config user.name && git -C $REPO_ROOT config user.email   # set these if empty
+  git -C $REPO_ROOT add server-setup/version.env
+  git -C $REPO_ROOT commit -m \"chore: bump Hindsight to $ver\"
+  git -C $REPO_ROOT push origin main
+
+Release: $html_url"
+        rm -f "$LOG"
+        open_or_dedupe_issue "Hindsight auto-upgraded to $ver but version.env commit failed" "$body" || true
+        exit 1
+      else
+        # commit_ok=1, push_ok=0: the LOCAL commit above already landed —
+        # only pushing it to origin/main failed. The fix is pull+push,
+        # NEVER a second commit (that would duplicate/conflict with the
+        # one that's already there).
         echo "ERROR: push of version.env failed after a successful upgrade to $ver — hindsight is healthy on $ver, but the commit on the server has not reached origin/main yet." >&2
         body="Hindsight was upgraded to $ver and passed its smoke test — it is healthy and running $ver right now. The commit bumping version.env to $ver already exists LOCALLY on the server; only pushing it to origin/main afterward FAILED. Nothing needs to be rolled back, and do NOT create a second commit.
 
@@ -393,9 +421,9 @@ Release: $html_url
 --- log tail (secrets redacted) ---
 $(redact_log "$LOG" | tail -n 100)"
       else
-        echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was restarted and VERIFIED healthy on $CUR." >&2
+        echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was confirmed still healthy on $CUR (restarted first if it had actually been stopped)." >&2
         title="Hindsight auto-upgrade to $ver failed before changing anything (restarted OK)"
-        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (the image pull, stopping hindsight, or the pre-upgrade backup itself) — nothing in the database was touched, no dump was needed, and bin/upgrade.sh VERIFIED hindsight is still healthy on $CUR (version.env pin + the running container's image + /health all checked).
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (the image pull, stopping hindsight, or the pre-upgrade backup itself) — nothing in the database was touched, no dump was needed. bin/upgrade.sh VERIFIED hindsight is still healthy on $CUR afterward (version.env pin + the running container's image + /health all checked) — restarting it first only if it had actually been stopped (a pull failure alone never stops it).
 
 Release: $html_url
 

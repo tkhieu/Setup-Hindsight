@@ -310,50 +310,92 @@ rm -rf "$TD"
 echo "ok - upgrade.sh --auto-rollback exits 3 when the rollback's own sed silently fails"
 
 # ============================================================================
-# Scenario E: the image pull itself fails, before anything was stopped or
-# touched. Must exit 2 (not the old bare untrapped exit 1) after verifying
-# hindsight is still fine on the unchanged CUR version — no pre-upgrade
-# dump needed, nothing was ever stopped.
+# Scenario E1: the image pull itself fails, INTERACTIVE mode (no flags at
+# all). Pull happens BEFORE stop, so hindsight is still running, untouched
+# — must behave EXACTLY as it always did before this script ever trapped
+# the pull step: bare exit 1, no `hs up -d` call (nothing to restart), no
+# verify, no extra "restarted"/"verified" noise.
 # ============================================================================
-TE="$(mktemp -d)"
-setup_common "$TE"
+TE1="$(mktemp -d)"
+setup_common "$TE1"
 
-HS_LOG_E="$TE/hs.log"
-: > "$HS_LOG_E"
+HS_LOG_E1="$TE1/hs.log"
+: > "$HS_LOG_E1"
 
-cat > "$TE/bin/hs" <<EOF
+cat > "$TE1/bin/hs" <<EOF
 #!/bin/sh
-echo "\$*" >> "$HS_LOG_E"
+echo "\$*" >> "$HS_LOG_E1"
+case "\$1" in
+  pull) exit 1 ;;  # cold pull / network failure
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TE1/bin/hs"
+
+cd "$TE1"
+set +e
+# No --yes: must answer the interactive confirmation prompt (the pull
+# itself comes right after it) — "y" so the run reaches and fails on pull.
+outE1="$(printf 'y\n' | PATH="$TE1/bin:$PATH" ./bin/upgrade.sh 1.1.1 2>&1)"
+rcE1=$?
+set -e
+cd "$HERE"
+
+[ "$rcE1" -eq 1 ] || { echo "$outE1"; echo "FAIL: expected plain interactive upgrade.sh to exit 1 after a pull failure, got $rcE1"; exit 1; }
+grep -q '^up\b\| up ' "$HS_LOG_E1" && { echo "FAIL: 'hs up' must never be called after an interactive pull failure (nothing was stopped):"; cat "$HS_LOG_E1"; exit 1; }
+printf '%s\n' "$outE1" | grep -qi "verif\|restart" && { echo "$outE1"; echo "FAIL: plain interactive mode must not print verify/restart noise for a pull failure"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TE1/version.env" \
+  || { echo "FAIL: version.env must be unchanged (still 1.1.0) after a pull failure:"; cat "$TE1/version.env"; exit 1; }
+
+rm -rf "$TE1"
+echo "ok - interactive (no flags) pull failure -> plain exit 1, no 'hs up -d', unchanged from before this script trapped the pull step"
+
+# ============================================================================
+# Scenario E2: same pull failure, but with --yes --auto-rollback (the
+# bin/check-upstream.sh calling convention). Must exit 2 after VERIFYING
+# hindsight is still fine on the unchanged CUR version — and still must
+# NEVER call `hs up -d` (there is nothing to restart; the pull happens
+# before hindsight is ever stopped).
+# ============================================================================
+TE2="$(mktemp -d)"
+setup_common "$TE2"
+
+HS_LOG_E2="$TE2/hs.log"
+: > "$HS_LOG_E2"
+
+cat > "$TE2/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_E2"
 case "\$1" in
   pull) exit 1 ;;  # cold pull / network failure
   ps)
     shift
     case "\$*" in
-      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TE/version.env" | cut -d= -f2)" ;;
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TE2/version.env" | cut -d= -f2)" ;;
       *) ;;
     esac
     exit 0 ;;
-  up) exit 0 ;;
   ready) exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
-chmod +x "$TE/bin/hs"
+chmod +x "$TE2/bin/hs"
 
-cd "$TE"
+cd "$TE2"
 set +e
-outE="$(PATH="$TE/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
-rcE=$?
+outE2="$(PATH="$TE2/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcE2=$?
 set -e
 cd "$HERE"
 
-[ "$rcE" -eq 2 ] || { echo "$outE"; echo "FAIL: expected upgrade.sh to exit 2 after a pull failure (restart verified), got $rcE"; exit 1; }
-printf '%s\n' "$outE" | grep -qi "VERIFIED healthy" || { echo "$outE"; echo "FAIL: missing the verified-healthy restart message"; exit 1; }
-grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TE/version.env" \
-  || { echo "FAIL: version.env must be unchanged (still 1.1.0) after a pull failure:"; cat "$TE/version.env"; exit 1; }
+[ "$rcE2" -eq 2 ] || { echo "$outE2"; echo "FAIL: expected upgrade.sh to exit 2 after a pull failure in auto mode (verified, not restarted), got $rcE2"; exit 1; }
+printf '%s\n' "$outE2" | grep -qi "verif" || { echo "$outE2"; echo "FAIL: missing a verify message"; exit 1; }
+grep -q '^up\b\| up ' "$HS_LOG_E2" && { echo "FAIL: 'hs up' must never be called after a pull failure (nothing was ever stopped), got:"; cat "$HS_LOG_E2"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TE2/version.env" \
+  || { echo "FAIL: version.env must be unchanged (still 1.1.0) after a pull failure:"; cat "$TE2/version.env"; exit 1; }
 
-rm -rf "$TE"
-echo "ok - upgrade.sh exits 2 (restart verified) when the image pull itself fails"
+rm -rf "$TE2"
+echo "ok - auto (--yes --auto-rollback) pull failure -> exit 2, verified only, never calls 'hs up -d'"
 
 # ============================================================================
 # Scenario F: the pre-upgrade backup fails AFTER hindsight was already
@@ -409,3 +451,69 @@ grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TF/version.env" \
 
 rm -rf "$TF"
 echo "ok - upgrade.sh exits 2 (restart verified) when the backup fails after hindsight was stopped"
+
+# ============================================================================
+# Scenario G: during auto-rollback, the rollback's OWN `hs up -d` call hangs
+# (a fake that just sleeps) instead of failing outright. Must be bounded by
+# $HINDSIGHT_HS_TIMEOUT (set tiny here so the test is fast), time out, and
+# exit 3 — a hang in recovery must never just hang forever.
+# ============================================================================
+TG="$(mktemp -d)"
+setup_common "$TG"
+
+HS_LOG_G="$TG/hs.log"
+UP_COUNT_G="$TG/.up_count"
+: > "$HS_LOG_G"
+
+cat > "$TG/bin/restore-db.sh" <<EOF
+#!/bin/sh
+exit 0
+EOF
+chmod +x "$TG/bin/restore-db.sh"
+
+cat > "$TG/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_G"
+case "\$1" in
+  pull) exit 0 ;;
+  stop) exit 0 ;;
+  ps) exit 0 ;;
+  exec)
+    shift
+    case "\$*" in
+      *pg_dump*) cat "$TG/fixture.sql" ;;
+    esac
+    exit 0 ;;
+  up)
+    n=0
+    [ -f "$UP_COUNT_G" ] && n="\$(cat "$UP_COUNT_G")"
+    n=\$((n + 1))
+    echo "\$n" > "$UP_COUNT_G"
+    # First "up" (the new version) fails normally, triggering rollback.
+    # Second "up" (the rollback's OWN restart) hangs instead of returning —
+    # this is the one that must be caught by the outer \`timeout\`.
+    [ "\$n" = 1 ] && exit 1
+    sleep 30
+    exit 0 ;;
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TG/bin/hs"
+
+cd "$TG"
+set +e
+START_G="$(date +%s)"
+outG="$(PATH="$TG/bin:$PATH" HINDSIGHT_HS_TIMEOUT=2 ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcG=$?
+END_G="$(date +%s)"
+set -e
+cd "$HERE"
+
+[ "$rcG" -eq 3 ] || { echo "$outG"; echo "FAIL: expected upgrade.sh to exit 3 when the rollback's own 'hs up -d' hangs/times out, got $rcG"; exit 1; }
+[ $((END_G - START_G)) -le 20 ] \
+  || { echo "FAIL: upgrade.sh took $((END_G - START_G))s — the stalled 'hs up -d' was not bounded by HINDSIGHT_HS_TIMEOUT"; exit 1; }
+printf '%s\n' "$outG" | grep -q "AUTO-ROLLBACK OK" && { echo "$outG"; echo "FAIL: must not claim 'AUTO-ROLLBACK OK' when 'hs up -d' hung"; exit 1; }
+
+rm -rf "$TG"
+echo "ok - a stalled 'hs up -d' during auto-rollback is bounded by \$HINDSIGHT_HS_TIMEOUT and exits 3"

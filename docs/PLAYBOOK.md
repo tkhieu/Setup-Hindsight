@@ -646,7 +646,9 @@ dựa vào systemd:
 | `docker image pull` (`upgrade.sh`, bước 2/7) | `HINDSIGHT_PULL_TIMEOUT` | 600s |
 | `bin/backup.sh`/`bin/backup-r2.sh` (`upgrade.sh`, bước 4/4b) | `HINDSIGHT_BACKUP_TIMEOUT` | 900s |
 | `bin/restore-db.sh` trong auto-rollback (`upgrade.sh`) | `HINDSIGHT_RESTORE_TIMEOUT` | 900s |
-| `bin/hs ready` (mọi nơi) | `HINDSIGHT_READY_TIMEOUT` | 60s (300s ở bước 7/7 lúc upgrade) |
+| `hs stop`/`hs up -d`/`hs ps` (mọi nơi trong `upgrade.sh`, kể cả stop/recovery/verify) | `HINDSIGHT_HS_TIMEOUT` | 120s — gần như lúc nào cũng tức thì, chỉ đề phòng docker daemon đứng |
+| `bin/hs ready` (nội bộ, chính nó) | `HINDSIGHT_READY_TIMEOUT` | 60s (300s ở bước 7/7 lúc upgrade) — vòng lặp curl bên trong `bin/hs` |
+| `bin/hs ready` (bọc ngoài, chặn hang TRƯỚC khi vòng lặp trên kịp chạy — ví dụ `docker compose port` đứng) | `HINDSIGHT_READY_OUTER_MARGIN` (cộng thêm vào `HINDSIGHT_HS_TIMEOUT`/budget phía trên) | +30s |
 | khoá `.ops.lock` (chờ cầm khoá) | `HINDSIGHT_OPS_LOCK_TIMEOUT` | 3600s |
 
 Hết giờ ở bất kỳ bước nào trong số này đều `exit` khác 0 ngay — không bao
@@ -656,14 +658,19 @@ giờ treo mãi và chờ `systemctl stop` can thiệp.
 quy trình rollback thủ công ở §8 — dừng `hindsight`, trả `version.env` về
 version cũ, `bin/restore-db.sh --yes --no-start` đúng bản dump pre-upgrade,
 `up -d` — chỉ khác là làm tự động thay vì in lệnh ra cho người chạy tay.
-Một lỗi xảy ra TRƯỚC khi version.env bị đổi (pull ảnh, dừng hindsight, hoặc
-chính bước backup thất bại) thì không cần rollback kiểu dump-restore — chỉ
-cần khởi động lại hindsight trên version CŨ (không đổi gì). Cả hai đường —
-rollback thật và khởi động lại — đều phải được **VERIFY** (không chỉ tin
-vào exit code của một lệnh): `version.env` ghi đúng version cũ, tag image
-của container ĐANG CHẠY (`hs ps --format '{{.Image}}' hindsight`) khớp
-version cũ, VÀ `/health` trả OK. `bin/upgrade.sh --auto-rollback` phân biệt
-rõ hai kết quả bằng exit code:
+Một lỗi xảy ra TRƯỚC khi version.env bị đổi thì không cần rollback kiểu
+dump-restore. Nếu hindsight ĐÃ bị dừng (bước backup thất bại) thì khởi động
+lại nó trên version CŨ (không đổi gì). Nếu pull ảnh mới tự nó fail —
+hindsight CHƯA từng bị dừng — thì không chạy `hs up -d` chút nào (không có
+gì để khởi động lại); chỉ VERIFY nó vẫn đang khoẻ, nguyên trạng. Không có
+flag nào (`upgrade.sh` chạy tay, không `--yes`/`--auto-rollback`) thì một
+lỗi pull vẫn `exit 1` trần như trước giờ, không VERIFY/khởi động lại gì —
+hành vi y hệt lúc chưa có cơ chế này. Mọi đường VERIFY (rollback thật, khởi
+động lại, hoặc chỉ xác nhận không có gì thay đổi) đều kiểm cùng ba thứ
+(không chỉ tin vào exit code của một lệnh): `version.env` ghi đúng version
+cũ, tag image của container ĐANG CHẠY (`hs ps --format '{{.Image}}'
+hindsight`) khớp version cũ, VÀ `/health` trả OK. `bin/upgrade.sh
+--auto-rollback` phân biệt rõ hai kết quả bằng exit code:
 
 | Exit code | Nghĩa |
 |---|---|
@@ -702,7 +709,8 @@ pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 | Title | Nghĩa |
 |---|---|
 | `Hindsight auto-upgraded to X.Y.Z` | Patch đã tự nâng xong, smoke test pass, `version.env` đã commit + push. |
-| `Hindsight auto-upgraded to X.Y.Z but version.env push failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — commit `version.env` ĐÃ nằm sẵn ở local trên server, chỉ việc PUSH lên `origin/main` lỗi. KHÔNG cần rollback, và **KHÔNG BAO GIỜ commit lại lần hai** — chỉ `git status`/`git log origin/main..HEAD` rồi `git pull --rebase origin main` (hoặc tự resolve) + `git push origin main` (lệnh chính xác nằm trong issue). |
+| `Hindsight auto-upgraded to X.Y.Z but version.env commit failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — nhưng `git commit` TRÊN SERVER tự nó lỗi (CHƯA có commit nào, khác với dòng dưới) — thường do thiếu `git config user.name`/`user.email`, hoặc hook `pre-commit`/`commit-msg` chặn. KHÔNG cần rollback — sửa git identity/hook rồi `add` + `commit` + `push` lại từ đầu (lệnh chính xác nằm trong issue). |
+| `Hindsight auto-upgraded to X.Y.Z but version.env push failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — commit `version.env` ĐÃ nằm sẵn ở local trên server (khác với dòng trên — commit đã thành công, chỉ push lỗi), chỉ việc PUSH lên `origin/main` lỗi. KHÔNG cần rollback, và **KHÔNG BAO GIỜ commit lại lần hai** — chỉ `git status`/`git log origin/main..HEAD` rồi `git pull --rebase origin main` (hoặc tự resolve) + `git push origin main` (lệnh chính xác nằm trong issue). |
 | `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` | Patch tự nâng fail SAU khi đã có bản dump pre-upgrade, auto-rollback THÀNH CÔNG và đã được VERIFY (`upgrade.sh` exit `2`) — đã về version cũ, khoẻ; `version.env` KHÔNG đổi, không commit/push. Log tail (đã redact secret) nằm trong issue. |
 | `Hindsight auto-upgrade to X.Y.Z failed before changing anything (restarted OK)` | Patch tự nâng fail TRƯỚC khi version.env bị đổi (pull ảnh, dừng hindsight, hoặc chính bước backup thất bại) — không có gì để rollback, không có dump nào được tạo; `upgrade.sh` (exit `2`) đã khởi động lại hindsight và VERIFY nó vẫn khoẻ trên version cũ. |
 | `Hindsight auto-upgrade to X.Y.Z failed AND rollback failed — manual action needed` | Patch tự nâng fail SAU khi đã có bản dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`, hoặc bất kỳ code lạ khác) — trạng thái hindsight KHÔNG RÕ, cần làm theo lệnh restore tay trong issue (đường dẫn bản dump pre-upgrade + lệnh §6/§8) NGAY. |
@@ -737,6 +745,7 @@ pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 | Patch mới nhưng issue báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
 | Issue báo "...failed AND rollback failed — manual action needed" | upgrade fail sau khi có dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`) | làm theo lệnh restore tay trong issue NGAY (§6/§8), đừng đợi lần chạy tuần sau |
 | Issue báo "...failed before changing anything AND the restart could not be verified" | upgrade fail TRƯỚC khi version.env đổi, và việc VERIFY khởi động lại cũng fail (`upgrade.sh` exit `3`, không có dump) | `bin/hs ps`/`bin/hs up -d`/`bin/hs ready`/`bin/hs logs hindsight` tay NGAY |
+| Issue báo "...but version.env commit failed" | upgrade + smoke pass, nhưng `git commit` trên server tự nó lỗi — CHƯA có commit nào | hindsight đang khoẻ, không cần rollback — kiểm `git config user.name`/`user.email` và hook `pre-commit`/`commit-msg`, rồi `add`+`commit`+`push` lại theo lệnh trong issue |
 | Issue báo "...but version.env push failed" | upgrade + smoke pass, commit đã có sẵn ở local — chỉ PUSH lên `origin/main` lỗi | hindsight đang khoẻ, không cần rollback, **ĐỪNG commit lại** — chỉ `git pull --rebase origin main` rồi `git push origin main` theo lệnh trong issue |
 | Muốn xem compose đã resolve image/port/volume đúng chưa | `hs config` (không flag) in MỌI secret đã resolve ra stdout | chỉ dùng `hs config --services` hoặc `hs config --quiet` (validate, không in secret); hai flag này cố ý là lựa chọn DUY NHẤT được cho phép |
 

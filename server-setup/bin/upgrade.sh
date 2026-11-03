@@ -14,22 +14,27 @@
 #                   --no-start, start hindsight back up on the old version
 #                   and VERIFY it (version.env pin + the running container's
 #                   own image tag + /health). A failure BEFORE version.env
-#                   was bumped (pull, stop, or the pre-upgrade backup itself)
-#                   never needed a dump-restore rollback — it just restarts
-#                   hindsight on the unchanged old version and verifies the
-#                   same way. Either way, exit code distinguishes the
-#                   outcome:
+#                   was bumped never needed a dump-restore rollback:
+#                     - if hindsight was already stopped (the pre-upgrade
+#                       backup itself failed), this restarts it on the
+#                       unchanged old version and verifies the same way;
+#                     - if hindsight was never even stopped (the image pull
+#                       itself failed), there is nothing to restart — this
+#                       only VERIFIES it is still fine, exactly as it was.
+#                   Either way, exit code distinguishes the outcome:
 #                     2 = upgrade failed, but hindsight is VERIFIED healthy
-#                         on the OLD version afterward (whether that took a
-#                         real auto-rollback, or just a restart because
-#                         nothing had changed yet)
+#                         on the OLD version afterward (a real auto-rollback,
+#                         a restart, or just re-confirming nothing changed)
 #                     3 = that verification FAILED (unknown/bad state —
 #                         manual action needed now; see the log for exactly
 #                         which step failed, and the pre-upgrade dump path
 #                         if one was taken)
 #                   Without --auto-rollback, a failure after version.env was
 #                   bumped keeps exiting 1 (unchanged) and only prints the
-#                   rollback commands instead of running them.
+#                   rollback commands instead of running them; a failure
+#                   before that point behaves exactly as it always has
+#                   (restart-if-stopped, or a bare exit 1 if the pull itself
+#                   failed — no verification, no extra noise either way).
 # --smoke           after /health is ready, also run bin/smoke.sh. A smoke
 #                   failure is treated the same as a failed /health wait
 #                   (triggers --auto-rollback if given).
@@ -56,6 +61,16 @@ HS="$CONFIG_DIR/bin/hs"
 PULL_TIMEOUT="${HINDSIGHT_PULL_TIMEOUT:-600}"       # cold docker image pull
 BACKUP_TIMEOUT="${HINDSIGHT_BACKUP_TIMEOUT:-900}"   # bin/backup.sh / bin/backup-r2.sh
 RESTORE_TIMEOUT="${HINDSIGHT_RESTORE_TIMEOUT:-900}" # bin/restore-db.sh, auto-rollback
+HS_TIMEOUT="${HINDSIGHT_HS_TIMEOUT:-120}"           # hs stop/up -d/ps — normally near-instant
+# Extra margin added ON TOP of $HS_TIMEOUT whenever wrapping `hs ready`: that
+# subcommand already has its own internal retry budget (HINDSIGHT_READY_TIMEOUT,
+# default 60s, governing the curl loop inside bin/hs) — this outer `timeout`
+# exists only to catch a hang in something BEFORE that loop even starts (e.g.
+# `docker compose port`, which `hs ready` calls first to resolve the URL).
+# `timeout` kills the whole `hs ready` process tree the same way regardless
+# of where it got stuck, so this only needs to be "bigger than the inner
+# budget", not an exact match.
+READY_OUTER_MARGIN="${HINDSIGHT_READY_OUTER_MARGIN:-30}"
 
 YES=0
 AUTO_ROLLBACK=0
@@ -110,20 +125,26 @@ if [ "$YES" != 1 ]; then
 fi
 
 # Arm the trap NOW, BEFORE the pull below — not after it. A pull failure
-# leaves the running stack and version.env untouched, but it must still be
-# verified-and-reported the same way any other failure is (this is exactly
-# what makes "image pull failure -> exit 2" a meaningful, tested contract
-# for bin/check-upstream.sh, instead of a bare untrapped `exit 1`).
+# leaves the running stack and version.env untouched, but with --auto-rollback
+# it must still be verified-and-reported the same way any other failure is
+# (this is exactly what makes "image pull failure -> exit 2" a meaningful,
+# tested contract for bin/check-upstream.sh, instead of a bare untrapped
+# `exit 1`). Without --auto-rollback (plain interactive use, no flags), a
+# pull failure is reported identically to how it always was: nothing was
+# touched, so on_exit just re-raises the original exit status — no `hs up
+# -d`, no verify, no extra noise.
 # VERSION_BUMPED distinguishes the two recoveries the trap can give: before
-# version.env is touched (covers a failed pull, a failed stop, or a failed
-# backup), the fix is just "make sure hindsight is still up on $CUR"
-# (nothing else changed, so `hs up -d` is a safe no-op if it was never
-# stopped); after, it's the full dump-restore rollback below. Either way,
-# the outcome is now VERIFIED (version.env + the running container's own
-# image tag + a real /health check), not just assumed from a command's exit
-# status — see verify_on_version.
+# version.env is touched, after it's the full dump-restore rollback below.
+# STOPPED further splits the "before" case: if hindsight was never actually
+# stopped (the pull itself failed), `hs up -d` is not just unnecessary, it's
+# the wrong thing to run — there is nothing to restart, and running it
+# anyway only adds a pointless docker call to a state that was never
+# touched. Once the outcome IS checked, it's VERIFIED (version.env + the
+# running container's own image tag + a real /health check), not just
+# assumed from a command's exit status — see verify_on_version.
 FAILED=1
 VERSION_BUMPED=0
+STOPPED=0
 print_rollback() {
   cat >&2 <<TXT
 
@@ -159,7 +180,7 @@ verify_on_version() {
     echo "ERROR: version.env pins '$env_ver', expected '$expected'." >&2
     return 1
   fi
-  image="$("$HS" ps --format '{{.Image}}' hindsight 2>/dev/null | tail -n1)"
+  image="$(timeout "$HS_TIMEOUT" "$HS" ps --format '{{.Image}}' hindsight 2>/dev/null | tail -n1)"
   case "$image" in
     *":$expected") ;;
     *)
@@ -167,8 +188,8 @@ verify_on_version() {
       return 1
       ;;
   esac
-  if ! "$HS" ready; then
-    echo "ERROR: hindsight on $expected did not answer /health." >&2
+  if ! timeout "$((HS_TIMEOUT + READY_OUTER_MARGIN))" "$HS" ready; then
+    echo "ERROR: hindsight on $expected did not answer /health (or 'hs ready' itself hung)." >&2
     return 1
   fi
   return 0
@@ -182,8 +203,8 @@ verify_on_version() {
 # it calls, so an unchecked command failing here would be silently ignored.
 do_auto_rollback() {
   echo "AUTO-ROLLBACK: restoring $CUR from $PRE_DUMP" >&2
-  if ! "$HS" stop hindsight; then
-    echo "WARNING: 'hs stop hindsight' failed during auto-rollback — continuing anyway." >&2
+  if ! timeout "$HS_TIMEOUT" "$HS" stop hindsight; then
+    echo "WARNING: 'hs stop hindsight' failed (or exceeded ${HS_TIMEOUT}s) during auto-rollback — continuing anyway." >&2
   fi
   if ! sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|" "$CONFIG_DIR/version.env"; then
     echo "ERROR: auto-rollback could not revert version.env to $CUR — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
@@ -193,8 +214,8 @@ do_auto_rollback() {
     echo "ERROR: auto-rollback's restore-db.sh failed (or exceeded ${RESTORE_TIMEOUT}s) — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
     return 1
   fi
-  if ! "$HS" up -d; then
-    echo "ERROR: auto-rollback could not start hindsight on $CUR — run manually: $HS up -d" >&2
+  if ! timeout "$HS_TIMEOUT" "$HS" up -d; then
+    echo "ERROR: auto-rollback could not start hindsight on $CUR (command failed or exceeded ${HS_TIMEOUT}s) — run manually: $HS up -d" >&2
     return 1
   fi
   if ! verify_on_version "$CUR"; then
@@ -217,17 +238,49 @@ on_exit() {
     fi
     print_rollback
     exit "$status"
-  else
+  elif [ "$STOPPED" = 1 ]; then
+    # Hindsight WAS actually stopped (the backup step failed, or `hs stop`
+    # itself reported success but hindsight was somehow still up) — unlike
+    # a pull failure below, there is something real to restart here.
     echo >&2
-    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back (no pre-upgrade dump exists yet either)." >&2
+    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back (no pre-upgrade dump exists yet either), but hindsight was stopped." >&2
     echo "Restarting hindsight on $CUR..." >&2
-    if "$HS" up -d && verify_on_version "$CUR"; then
-      echo "hindsight restarted on $CUR and VERIFIED healthy (version.env + image + /health)." >&2
-      exit 2
+    if [ "$AUTO_ROLLBACK" = 1 ]; then
+      if timeout "$HS_TIMEOUT" "$HS" up -d && verify_on_version "$CUR"; then
+        echo "hindsight restarted on $CUR and VERIFIED healthy (version.env + image + /health)." >&2
+        exit 2
+      else
+        echo "ERROR: could not VERIFY hindsight is back up and healthy on $CUR — run manually: $HS up -d; $HS ready; check: $HS logs hindsight" >&2
+        exit 3
+      fi
     else
-      echo "ERROR: could not VERIFY hindsight is back up and healthy on $CUR — run manually: $HS up -d; $HS ready; check: $HS logs hindsight" >&2
-      exit 3
+      if timeout "$HS_TIMEOUT" "$HS" up -d; then
+        echo "hindsight restarted on $CUR." >&2
+      else
+        echo "ERROR: could not restart hindsight automatically (command failed or exceeded ${HS_TIMEOUT}s) — run manually: $HS up -d" >&2
+      fi
+      exit "$status"
     fi
+  else
+    # Hindsight was NEVER stopped (the image pull itself failed) — it
+    # should still be running untouched. Running `hs up -d` here would be
+    # pointless at best (nothing to restart) and is simply the wrong
+    # action for a state that was never touched, so this never calls it —
+    # with --auto-rollback, only VERIFY that it's still fine; without any
+    # flags, behave exactly as before this script ever had a trap for the
+    # pull step: just re-raise the original exit status, no extra noise.
+    if [ "$AUTO_ROLLBACK" = 1 ]; then
+      echo >&2
+      echo "Upgrade aborted before anything was touched (e.g. the image pull failed) — verifying hindsight is still fine on $CUR, untouched..." >&2
+      if verify_on_version "$CUR"; then
+        echo "hindsight is still healthy on $CUR (verified, nothing was ever stopped or changed)." >&2
+        exit 2
+      else
+        echo "ERROR: could not VERIFY hindsight is healthy on $CUR — check: $HS logs hindsight" >&2
+        exit 3
+      fi
+    fi
+    exit "$status"
   fi
 }
 trap on_exit EXIT
@@ -235,11 +288,11 @@ trap on_exit EXIT
 say "2/7 Pull target image ($NEW) before changing anything"
 # Via shell env override (Compose gives shell env precedence over
 # --env-file for interpolation), NOT version.env yet: a bad version or
-# network failure here leaves the running stack and version.env untouched,
-# so on_exit's VERSION_BUMPED=0 branch just re-verifies hindsight is still
-# fine on $CUR (a no-op `hs up -d` if it was never stopped) rather than
-# rolling anything back. Bounded by $PULL_TIMEOUT — a cold pull is already
-# the single slowest step in this script and must not hang forever.
+# network failure here leaves the running stack and version.env untouched
+# AND unstopped (STOPPED is still 0) — on_exit's VERSION_BUMPED=0 branch
+# treats that as "nothing to restart", never calling `hs up -d`. Bounded
+# by $PULL_TIMEOUT — a cold pull is already the single slowest step in
+# this script and must not hang forever.
 HINDSIGHT_VERSION="$NEW" timeout "$PULL_TIMEOUT" "$HS" pull hindsight
 
 say "3/7 Stopping hindsight (db stays up) so the backup below is final"
@@ -249,8 +302,9 @@ say "3/7 Stopping hindsight (db stays up) so the backup below is final"
 # Stopping first means the dump taken in the next step is provably the
 # exact state the old version left behind — nothing written after it,
 # nothing missing from it.
-"$HS" stop hindsight
-running_services="$("$HS" ps --services --status running)"
+timeout "$HS_TIMEOUT" "$HS" stop hindsight
+STOPPED=1
+running_services="$(timeout "$HS_TIMEOUT" "$HS" ps --services --status running)"
 if printf '%s\n' "$running_services" | grep -qx hindsight; then
   echo "ERROR: hindsight is still running after 'hs stop hindsight' — aborting before touching anything else." >&2
   exit 1
@@ -277,11 +331,11 @@ grep -E '^HINDSIGHT_VERSION=' "$CONFIG_DIR/version.env"
 VERSION_BUMPED=1
 
 say "6/7 Up"
-"$HS" up -d
+timeout "$HS_TIMEOUT" "$HS" up -d
 
 say "7/7 Waiting for ready (up to 5 min)"
-if ! HINDSIGHT_READY_TIMEOUT=300 "$HS" ready; then
-  echo "NOT ready after 5 minutes. Check: hs logs hindsight" >&2
+if ! HINDSIGHT_READY_TIMEOUT=300 timeout "$((300 + READY_OUTER_MARGIN))" "$HS" ready; then
+  echo "NOT ready after 5 minutes (or 'hs ready' itself hung). Check: hs logs hindsight" >&2
   exit 1
 fi
 
