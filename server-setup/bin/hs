@@ -49,6 +49,11 @@ check_secrets() {
       exit 1
     fi
   fi
+  if [ "$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_EMBEDDINGS_PROVIDER)" = openai ] \
+    && env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY; then
+    echo "hs: HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY is empty in secrets.env — add a separate OpenAI project key for embeddings before starting hindsight." >&2
+    exit 1
+  fi
   if env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY; then
     echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — run bin/bootstrap.sh first." >&2
     exit 1

@@ -9,12 +9,7 @@
 #     cloudflared/.
 #   - API key auth enabled (HINDSIGHT_API_TENANT_EXTENSION/_API_KEY) — the
 #     example ships unauthenticated by default.
-#   - hf_cache volume added so the embedding/reranker models baked into the
-#     image (pgvector/pgvector tag aside, this is about the hindsight image:
-#     docker/standalone/Dockerfile pre-downloads bge-small-en-v1.5 +
-#     ms-marco-MiniLM-L-6-v2 into /home/hindsight/.cache/huggingface when
-#     built, which is how the published ghcr.io/vectorize-io/hindsight tag
-#     is built) survive a container recreate instead of re-downloading.
+#   - Slim standalone image: API and control plane, no local model cache.
 #   - json-file log rotation and healthchecks added (upstream ships
 #     neither).
 #   - db service not published at all (even the example's commented-out
@@ -52,7 +47,7 @@ services:
         max-file: "5"
 
   hindsight:
-    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}${HINDSIGHT_IMAGE_SUFFIX--slim}
     restart: unless-stopped
     depends_on:
       db:
@@ -69,6 +64,10 @@ services:
       # hindsight with an API-key provider (Compose cannot guard conditionally).
       HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-}
       HINDSIGHT_API_LLM_CHATGPT_HOME: ${HINDSIGHT_API_LLM_CHATGPT_HOME:-/home/hindsight/.hindsight/chatgpt}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${HINDSIGHT_API_EMBEDDINGS_PROVIDER:-openai}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:-text-embedding-3-small}
+      HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}
+      HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_API_RERANKER_PROVIDER:-rrf}
       # ApiKeyTenantExtension — confirmed in
       # hindsight_api/extensions/builtin/tenant.py. The value is a
       # module:ClassName import path, not a bare class name.
@@ -83,7 +82,6 @@ services:
       # secret from the API key above.
       HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:?set HINDSIGHT_CP_ACCESS_KEY in secrets.env}
     volumes:
-      - hf_cache:/home/hindsight/.cache/huggingface
       - chatgpt_credentials:/home/hindsight/.hindsight/chatgpt
     healthcheck:
       # No curl/wget in this image's final stage (confirmed in
@@ -105,7 +103,7 @@ services:
   # New named volumes start root-owned. The app image runs as UID 1000;
   # token refreshes need write access after the initial credential import.
   chatgpt-volume-init:
-    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}${HINDSIGHT_IMAGE_SUFFIX--slim}
     user: "0:0"
     entrypoint: ["/bin/sh", "-c"]
     command: ["chown 1000:1000 /chatgpt"]
@@ -114,9 +112,4 @@ services:
 
 volumes:
   pgdata:
-  # Seeded from the image on first use with the baked-in embedding/reranker
-  # models (and correct UID 1000 ownership — see docker/standalone/
-  # Dockerfile's comment on /home/hindsight/.pg0 for why that seeding only
-  # works because the path already exists in the image with that owner).
-  hf_cache:
   chatgpt_credentials:

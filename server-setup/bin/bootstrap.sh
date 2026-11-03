@@ -69,6 +69,12 @@ TXT
   exit 0
 fi
 
+if [ "$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_EMBEDDINGS_PROVIDER)" = openai ] \
+  && env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY; then
+  echo "Chưa chạy được: thêm OpenAI project key riêng vào HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY trong secrets.env (xem secrets.env.example), rồi chạy lại bin/bootstrap.sh." >&2
+  exit 1
+fi
+
 say "Pulling images"
 "$HS" pull
 

@@ -30,21 +30,22 @@ xem `workstation/` (đang làm ở PR khác trong cùng repo) — không lặp l
 | `cloudflared-hindsight` | server, systemd **user** service, binary host (không phải trong Docker) | không cần sudo, có linger |
 | Config | `~/hindsight/server-setup` (git) | = thư mục này |
 | Repo | `github.com/tkhieu/Setup-Hindsight` (private) | |
-| Dữ liệu persistent | volume `hindsight_pgdata` (Postgres), `hindsight_hf_cache` (model local), `hindsight_chatgpt_credentials` (OAuth) | attachment lưu native trong Postgres (BYTEA) |
+| Dữ liệu persistent | volume `hindsight_pgdata` (Postgres), `hindsight_chatgpt_credentials` (OAuth) | attachment lưu native trong Postgres (BYTEA); volume `hindsight_hf_cache` cũ có thể dọn sau khi đã kiểm chứng |
 
 **Vì sao không cần checkout upstream riêng:** Hindsight không có file
 `docker-compose.yaml` cần sửa tại chỗ như Multica/Omnigent — `compose.yaml`
 ở đây là compose của chính chúng ta, viết dựa theo ví dụ `external-pg` chính
 thức của Vectorize (đã đối chiếu với source tag `v1.1.0`), cộng thêm:
-bind `127.0.0.1`, bật xác thực API key, volume cache model, log rotation,
+bind `127.0.0.1`, bật xác thực API key, log rotation,
 healthcheck.
 
-**LLM provider:** `chatgpt` mặc định, dùng gói ChatGPT Pro qua OAuth, không
-cần OpenAI API key. Model mặc định `gpt-6-luna`. Có thể đổi về `openai` bằng
-một dòng trong `base.env` và key trong `secrets.env` (§4.2). Embedding + reranker vẫn
-dùng model local mặc định của Hindsight (`bge-small-en-v1.5` +
-`ms-marco-MiniLM-L-6-v2`, đã nướng sẵn trong image) — đó là lý do có volume
-`hf_cache`: không có nó, mỗi lần tạo lại container sẽ tải lại model.
+**Tài nguyên/model:** image `hindsight:1.1.0-slim` vẫn phục vụ API :8888 và UI
+:9999, nhưng không mang model ML local. `chatgpt` vẫn là LLM mặc định qua OAuth
+(model mặc định `gpt-6-luna`). Embedding dùng OpenAI `text-embedding-3-small`
+(1536 chiều) qua project API key **riêng**; `rrf` giữ thứ tự fusion, không gọi
+cross-encoder. Vì bỏ neural reranking, độ chính xác thứ hạng có thể khác;
+kiểm tra các truy vấn recall thực tế sau khi chuyển. Key OpenAI có chi phí theo
+token embedding, gồm cả lần re-embed toàn bộ dữ liệu; đặt ngân sách/alert nhỏ.
 
 ---
 
@@ -249,6 +250,61 @@ bin/hs ready
 bin/smoke.sh
 ```
 
+### 4.6 Chuyển từ model local sang OpenAI embeddings (một lần)
+
+v1.1.0 **không tự re-embed** khi đổi 384 → 1536 chiều: startup từ chối DB còn
+embedding cũ. `hindsight-admin export-bank` bỏ vectors và `import-bank` tạo
+vectors mới, nhưng chỉ nhập vào bank chưa tồn tại. `bin/reembed.sh` xuất từng
+bank, đổi tên DB cũ để giữ nguyên bản gốc, nhập vào DB mới, so sánh số bank và
+memory unit, kiểm tra toàn bộ vector 1536 chiều, rồi mới bật app. Dừng ghi vào
+Hindsight trong suốt quá trình; giữ đủ dung lượng cho DB cũ + DB mới + dump.
+
+Trên server, tại `~/hindsight/server-setup`:
+
+```bash
+# 1. Tạo OpenAI project key, giới hạn quyền embeddings nếu có thể và đặt budget.
+#    Điền HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY vào secrets.env bằng editor.
+git -C .. pull
+bin/hs pull
+bin/hs stop hindsight              # đóng khoảng ghi trước bản backup
+bin/backup.sh pre-embeddings-manual # ghi lại đường dẫn dump in ra
+bin/hs up -d db                     # chỉ DB: app chưa thể boot với vector cũ
+bin/reembed.sh                      # dry-run, không thay đổi trạng thái
+bin/reembed.sh --yes                # tự backup lần nữa trước khi đổi DB
+bin/smoke.sh
+bin/hs ready
+# Đo thời gian vài lệnh recall đại diện; kiểm tra kết quả và log timeout.
+```
+
+Không chạy `bin/hs up -d` toàn stack trước `reembed.sh`: DB cũ có vector 384
+chiều và Hindsight sẽ từ chối model 1536 chiều. Script giữ DB cũ tên
+`hindsight_db_pre_embeddings_<giờ>` và in đường dẫn dump. Chạy lại script sau
+khi thành công là no-op. **Giữ dump pre-switch bên ngoài lịch prune 14 bản**
+(sao chép ra nơi an toàn); volume `hindsight_hf_cache` cũ chỉ dọn về sau.
+`smoke.sh` và `restore-db.sh --drill-full <dump mới>` tiếp tục chạy: container
+diễn tập nhận cùng env từ Compose, gồm key embedding riêng.
+
+Rollback (thực hiện trước khi mở lại ghi; dùng đúng đường dẫn dump đã ghi):
+
+```bash
+bin/hs stop hindsight
+# Sửa version.env: HINDSIGHT_IMAGE_SUFFIX= (để trống = image full 1.1.0)
+# Sửa base.env: HINDSIGHT_API_EMBEDDINGS_PROVIDER=local,
+#               HINDSIGHT_API_RERANKER_PROVIDER=local
+bin/hs pull
+bin/restore-db.sh --yes --no-start <dump-pre-switch-db.sql.gz>
+bin/hs up -d
+bin/hs ready
+bin/smoke.sh
+```
+
+Nếu OpenAI trả 401: kiểm tra project key đúng biến
+`HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY`, quyền embeddings và quota/billing;
+không đổi `HINDSIGHT_API_LLM_API_KEY` (ChatGPT OAuth). Nếu log báo dimension
+mismatch: dừng app, chạy `reembed.sh --yes` khi DB vẫn là bản cũ, hoặc restore
+dump pre-switch và làm lại. Nếu import fail, script cố khôi phục tên DB cũ,
+giữ archive và dump; xem log, kiểm tra DB trước khi thử lại.
+
 ---
 
 ## 5. Backup
@@ -261,7 +317,8 @@ ls backups/
 Chỉ cần backup Postgres — attachment Hindsight lưu native trong Postgres
 (`BYTEA`, xác nhận trong `hindsight_api/config.py`:
 `DEFAULT_FILE_STORAGE_TYPE = "native"`), không có volume uploads riêng. Volume
-`hf_cache` chỉ chứa model weight tải lại được, không backup.
+Volume `hf_cache` cũ chỉ chứa model weight tải lại được, không backup và
+không còn mount trong image slim.
 Volume `chatgpt_credentials` **không backup lên R2** vì backup R2 hiện không
 mã hóa. Mất server thì đăng nhập ChatGPT và chuyển credential lại (§4.2).
 
@@ -726,14 +783,14 @@ pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 |---|---|---|
 | Đổi env mà không có tác dụng | dùng `restart` thay vì `up -d` | `bin/hs up -d` |
 | `bin/hs ready` fail ngay sau `up -d` | container cần vài giây để migration chạy xong | mặc định chờ tới 60s; `HINDSIGHT_READY_TIMEOUT=180 bin/hs ready` nếu cần lâu hơn |
-| `hs up` báo thiếu secret và dừng | `secrets.env` thiếu file, tenant/UI key trống, hoặc provider API-key thiếu `HINDSIGHT_API_LLM_API_KEY` | `bin/bootstrap.sh` (idempotent); với OpenAI điền key |
+| `hs up` báo thiếu secret và dừng | `secrets.env` thiếu file, tenant/UI key trống, hoặc thiếu key riêng cho OpenAI embeddings | điền `HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY` theo §4.6; `bin/bootstrap.sh` sinh các secret nội bộ |
 | `hs up` báo ChatGPT credentials thiếu | chưa chuyển credential hoặc plan scope chưa được cấp | làm lại §4.2; kiểm `bin/chatgpt-login.sh --status` |
 | `hindsight-admin chatgpt login` báo `Fetching OpenAI JWKS returned HTTP 503` | OpenAI tạm thời không phục vụ JWKS | thử lại sau; kiểm `chatgpt status` thành công trên máy dev trước khi chuyển credential |
 | Retain/recall báo refresh token invalid | session ChatGPT hết hiệu lực | đăng nhập lại trên máy dev, chuyển lại bằng `bin/chatgpt-login.sh`, sau đó `logout --local-only` trên máy dev |
 | Retain/recall bị trì hoãn khi hết hạn mức Pro | ChatGPT plan đã hết usage trong chu kỳ | xem ChatGPT Settings → Usage; Hindsight hoãn retain/consolidation rồi thử lại sau 30 phút |
 | Retain/recall lỗi với provider OpenAI | API key sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
 | UI load được nhưng gọi API lỗi 401 | `HINDSIGHT_CP_DATAPLANE_API_KEY` lệch `HINDSIGHT_API_TENANT_API_KEY` | hai biến này PHẢI giống nhau trong `compose.yaml` (đã set cứng — nếu bạn tự sửa compose, đừng tách ra) |
-| Container tạo lại xong, retain đầu tiên chậm hẳn | volume `hf_cache` bị xoá/mount sai, model tải lại từ HuggingFace | `docker volume inspect hindsight_hf_cache`; đừng `docker volume rm` volume này khi không cố ý |
+| Recall vẫn chậm hoặc ít đúng hơn | OpenAI embedding lỗi/chậm hoặc RRF không dùng cross-encoder | xem log `hindsight`, đo latency và so kết quả truy vấn đại diện; xem §4.6 |
 | Cùng lúc 3 app backup, máy chậm hẳn lúc 01:00-01:35 (giờ local server, xem §5) | Multica/Omnigent/Hindsight timer gần giờ nhau (đã lệch 5-15 phút có chủ đích, nhưng `RandomizedDelaySec` vẫn có thể trùng ngẫu nhiên) | `systemctl --user list-timers` xem giờ chạy thật; không phải lỗi, chỉ là trùng xác suất thấp |
 | `site trả 502/530` | cloudflared chết hoặc container down | `systemctl --user status cloudflared-hindsight` → `bin/hs ps` |
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
