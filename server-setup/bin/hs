@@ -32,26 +32,25 @@ check_secrets() {
     exit 1
   fi
   [ "$starting_hindsight" = 1 ] || return 0
-  local api_key
-  api_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY)"
-  if [ -z "$api_key" ]; then
-    echo "hs: HINDSIGHT_API_TENANT_API_KEY is empty in secrets.env — refusing to start unauthenticated." >&2
-    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_CP_ACCESS_KEY)." >&2
+  if env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_DB_PASSWORD; then
+    echo "hs: HINDSIGHT_DB_PASSWORD is empty in secrets.env — run bin/bootstrap.sh first." >&2
     exit 1
   fi
-  local provider llm_key
+  if env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY; then
+    echo "hs: HINDSIGHT_API_TENANT_API_KEY is empty in secrets.env — refusing to start unauthenticated." >&2
+    echo "hs: run bin/bootstrap.sh first." >&2
+    exit 1
+  fi
+  local provider
   provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
   if [ "$provider" != chatgpt ]; then
-    llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
-    if [ -z "$llm_key" ]; then
+    if env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY; then
       echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set the API key for provider ${provider:-openai} first." >&2
       exit 1
     fi
   fi
-  local cp_key
-  cp_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY)"
-  if [ -z "$cp_key" ]; then
-    echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — set a UI login password first." >&2
+  if env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY; then
+    echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — run bin/bootstrap.sh first." >&2
     exit 1
   fi
 }
