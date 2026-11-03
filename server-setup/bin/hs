@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Wrapper around `docker compose` for the Hindsight stack: ties together
+# compose.yaml + version.env + base.env + secrets.env.
+#
+#   bin/hs ps · logs -f hindsight · up -d · pull · down
+#   bin/hs ready    -> poll GET /health until it answers
+#   bin/hs url      -> print the published API base URL
+#
+# Refuses `up`/`start`/`run`/`create` outright if secrets.env is missing or
+# HINDSIGHT_API_TENANT_API_KEY is empty — compose.yaml's own
+# `${VAR:?...}` guards would catch this too, but only after docker has
+# already started pulling/creating containers, so check first.
+set -euo pipefail
+
+CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/env.sh"
+COMPOSE_FILE="$CONFIG_DIR/compose.yaml"
+
+compose() {
+  docker compose \
+    -f "$COMPOSE_FILE" \
+    --env-file "$CONFIG_DIR/version.env" \
+    --env-file "$CONFIG_DIR/base.env" \
+    --env-file "$CONFIG_DIR/secrets.env" \
+    "$@"
+}
+
+check_secrets() {
+  if [ ! -f "$CONFIG_DIR/secrets.env" ]; then
+    echo "hs: missing $CONFIG_DIR/secrets.env — run bin/bootstrap.sh first." >&2
+    exit 1
+  fi
+  local api_key
+  api_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY)"
+  if [ -z "$api_key" ]; then
+    echo "hs: HINDSIGHT_API_TENANT_API_KEY is empty in secrets.env — refusing to start unauthenticated." >&2
+    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_API_LLM_API_KEY and HINDSIGHT_CP_ACCESS_KEY)." >&2
+    exit 1
+  fi
+  local llm_key
+  llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
+  if [ -z "$llm_key" ]; then
+    echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set your OpenAI key first." >&2
+    exit 1
+  fi
+  local cp_key
+  cp_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY)"
+  if [ -z "$cp_key" ]; then
+    echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — set a UI login password first." >&2
+    exit 1
+  fi
+}
+
+# Host:port compose actually published, read back instead of guessed (same
+# approach as Multica's bin/mc / Omnigent's bin/og).
+backend_url() {
+  local hostport
+  hostport="$(compose port hindsight 8888 2>/dev/null | tail -n1)" || true
+  [ -n "$hostport" ] || { echo "http://127.0.0.1:8888"; return; }
+  echo "http://${hostport}"
+}
+
+case "${1:-}" in
+  -*)
+    echo "bin/hs: put options after the subcommand (bin/hs supplies -f/--env-file itself)" >&2
+    exit 2
+    ;;
+  ready)
+    # GET /health — alias of /health/ready (hindsight_api/api/http.py).
+    url="$(backend_url)/health"
+    timeout="${HINDSIGHT_READY_TIMEOUT:-60}"
+    echo "GET $url (timeout ${timeout}s)"
+    SECONDS=0
+    while true; do
+      remaining=$((timeout - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      curl_timeout=$remaining; [ "$curl_timeout" -gt 5 ] && curl_timeout=5
+      if out="$(curl -fsS --connect-timeout 3 --max-time "$curl_timeout" "$url" 2>/dev/null)"; then echo "$out"; exit 0; fi
+      remaining=$((timeout - SECONDS))
+      [ "$remaining" -gt 0 ] || break
+      sleep_for=$remaining; [ "$sleep_for" -gt 3 ] && sleep_for=3
+      sleep "$sleep_for"
+    done
+    echo "not ready after ${timeout}s — see: hs logs hindsight" >&2
+    exit 1
+    ;;
+  url)
+    backend_url
+    ;;
+  config)
+    # `docker compose config` with no restricting flag prints every secret
+    # fully resolved (POSTGRES_PASSWORD, API keys, ...) to stdout — exactly
+    # the kind of thing that ends up pasted into a chat/ticket or captured
+    # by a CI log. Only allow the forms that validate without printing
+    # resolved values.
+    shift
+    if [ $# -eq 0 ]; then
+      echo "hs: 'config' with no flags prints every resolved secret — use 'hs config --services' or 'hs config --quiet' (validates without printing)." >&2
+      exit 1
+    fi
+    for arg in "$@"; do
+      case "$arg" in
+        --services | --quiet) ;;
+        *)
+          echo "hs: 'config' only allows --services/--quiet — anything else resolves secrets into the output." >&2
+          exit 1
+          ;;
+      esac
+    done
+    compose config "$@"
+    ;;
+  up|start|run|create)
+    check_secrets
+    compose "$@"
+    ;;
+  *)
+    compose "$@"
+    ;;
+esac

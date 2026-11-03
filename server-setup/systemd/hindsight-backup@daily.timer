@@ -1,0 +1,11 @@
+[Unit]
+Description=Hindsight DB: promote newest 6h snapshot to daily
+
+[Timer]
+# Offset 5 min from Multica's/Omnigent's daily promote (both at 01:00:00).
+OnCalendar=*-*-* 01:05:00
+Persistent=true
+Unit=hindsight-backup@daily.service
+
+[Install]
+WantedBy=timers.target

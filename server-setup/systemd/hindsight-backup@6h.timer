@@ -1,0 +1,21 @@
+[Unit]
+Description=Hindsight DB backup every 6 hours
+
+[Timer]
+# Offset 15 min from Multica's/Omnigent's 6h timer (both at 00/6:00:00) so
+# the three don't start their pg_dump at the same second. NOTE: the date
+# wildcard prefix is required — "15/6:00:00" parses the HOUR field as
+# "15/6" (step 6 from hour 15: fires 15:00 and 21:00 only), not minute=15;
+# verified with `systemd-analyze calendar --iterations=5`. The form below
+# fires at 00:15/06:15/12:15/18:15, confirmed the same way.
+OnCalendar=*-*-* 00/6:15:00
+# Persistent: a reboot at 03:00 means the 00:15 run was missed — catch up as
+# soon as the machine is back up. The sleep loop inside a container has no
+# equivalent, which is the main reason this is a systemd timer, not a
+# compose service.
+Persistent=true
+RandomizedDelaySec=120
+Unit=hindsight-backup@6h.service
+
+[Install]
+WantedBy=timers.target
