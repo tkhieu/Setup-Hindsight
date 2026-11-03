@@ -31,6 +31,11 @@ cat > "$TMP/bin/hs" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$CALLS"
 case "$*" in
+  ready)
+    printf 'ready timeout=%s\n' "${HINDSIGHT_READY_TIMEOUT:-60}" >> "$CALLS"
+    [ "${HINDSIGHT_READY_TIMEOUT:-60}" -ge 300 ] || exit 1
+    [ "${FAIL_READY:-0}" = 0 ] || exit 1
+    ;;
   'stop hindsight')
     # Optional pause point so the test can probe the lock mid-run.
     if [ -n "${PAUSE_DIR:-}" ]; then
@@ -66,6 +71,10 @@ export CALLS="$TMP/calls" BACKUP_PATH="$TMP/backups/pre"
 grep -q 'DRY RUN' "$TMP/out"
 "$TMP/bin/reembed.sh" --yes > "$TMP/out"
 grep -q 'verified 1 bank' "$TMP/out"
+grep -q '^ready timeout=300$' "$CALLS"
+if find "$TMP/backups" -maxdepth 1 -name 'reembed.*' | grep -q .; then
+  echo "FAIL: export directory left after successful reembed"; exit 1
+fi
 python3 - "$CALLS" <<'PY'
 import sys
 calls=open(sys.argv[1]).read().splitlines()
@@ -96,6 +105,24 @@ grep -q 'could not acquire' "$TMP/lockerr" || { : > "$PAUSE_DIR/go"; wait "$pid"
 : > "$PAUSE_DIR/go"
 wait "$pid" || { cat "$TMP/out2"; echo "FAIL: paused reembed run did not finish successfully"; exit 1; }
 grep -q 'verified 1 bank' "$TMP/out2"
+
+# Readiness can fail after the database has been verified. The new DB must
+# remain in place, and the now-redundant export directory must be removed.
+: > "$CALLS"
+if FAIL_READY=1 "$TMP/bin/reembed.sh" --yes > "$TMP/failed-ready" 2>&1; then
+  echo "FAIL: reembed succeeded despite failed readiness"; exit 1
+fi
+grep -q 'data migrated and verified; app not ready within 300s' "$TMP/failed-ready"
+if grep -q 'restoring original database name' "$TMP/failed-ready" || grep -q 'dropdb' "$CALLS"; then
+  echo "FAIL: verified database was rolled back after readiness timeout"; exit 1
+fi
+if find "$TMP/backups" -maxdepth 1 -name 'reembed.*' | grep -q .; then
+  echo "FAIL: export directory left after readiness timeout"; exit 1
+fi
+: > "$CALLS"
+HINDSIGHT_REEMBED_READY_TIMEOUT=420 "$TMP/bin/reembed.sh" --yes > "$TMP/override"
+grep -q 'verified 1 bank' "$TMP/override"
+grep -q '^ready timeout=420$' "$CALLS"
 # Released on exit: the lock is free again.
 # positional parameter is expanded by child bash
 # shellcheck disable=SC2016
