@@ -6,10 +6,9 @@
 #   bin/hs ready    -> poll GET /health until it answers
 #   bin/hs url      -> print the published API base URL
 #
-# Refuses `up`/`start`/`run`/`create` outright if secrets.env is missing or
-# HINDSIGHT_API_TENANT_API_KEY is empty — compose.yaml's own
-# `${VAR:?...}` guards would catch this too, but only after docker has
-# already started pulling/creating containers, so check first.
+# Requires secrets.env for startup commands. When they start hindsight,
+# checks tenant/UI credentials and the selected LLM provider before Docker
+# starts the app. Database-only restore commands bypass the app checks.
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -27,27 +26,74 @@ compose() {
 }
 
 check_secrets() {
+  local starting_hindsight="$1"
   if [ ! -f "$CONFIG_DIR/secrets.env" ]; then
     echo "hs: missing $CONFIG_DIR/secrets.env — run bin/bootstrap.sh first." >&2
     exit 1
   fi
+  [ "$starting_hindsight" = 1 ] || return 0
   local api_key
   api_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY)"
   if [ -z "$api_key" ]; then
     echo "hs: HINDSIGHT_API_TENANT_API_KEY is empty in secrets.env — refusing to start unauthenticated." >&2
-    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_API_LLM_API_KEY and HINDSIGHT_CP_ACCESS_KEY)." >&2
+    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_CP_ACCESS_KEY)." >&2
     exit 1
   fi
-  local llm_key
-  llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
-  if [ -z "$llm_key" ]; then
-    echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set your OpenAI key first." >&2
-    exit 1
+  local provider llm_key
+  provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
+  if [ "$provider" != chatgpt ]; then
+    llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
+    if [ -z "$llm_key" ]; then
+      echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set the API key for provider ${provider:-openai} first." >&2
+      exit 1
+    fi
   fi
   local cp_key
   cp_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY)"
   if [ -z "$cp_key" ]; then
     echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — set a UI login password first." >&2
+    exit 1
+  fi
+}
+
+# Compose starts all services when no service is named. These are the only
+# service names in compose.yaml; a db/init-only command must work during restore.
+targets_hindsight() {
+  local command="$1" arg named_other=0
+  shift
+  for arg in "$@"; do
+    case "$arg" in
+      hindsight) return 0 ;;
+      db|chatgpt-volume-init)
+        [ "$command" = run ] && return 1
+        named_other=1
+        ;;
+    esac
+  done
+  [ "$named_other" = 0 ]
+}
+
+# Allow one-off sign-in/status commands to run before credentials exist.
+is_chatgpt_admin_run() {
+  [ "$1" = run ] || return 1
+  shift
+  local previous='' before_previous='' arg
+  for arg in "$@"; do
+    if [ "$before_previous" = hindsight ] && [ "$previous" = hindsight-admin ] && [ "$arg" = chatgpt ]; then
+      return 0
+    fi
+    before_previous="$previous"
+    previous="$arg"
+  done
+  return 1
+}
+
+check_chatgpt_status() {
+  local status
+  if ! status="$(compose run --rm -T --no-deps hindsight hindsight-admin chatgpt status 2>/dev/null)" \
+    || ! printf '%s\n' "$status" | grep -qx 'Signed in: yes' \
+    || ! printf '%s\n' "$status" | grep -qx 'Plan usage enabled: yes'; then
+    echo "hs: ChatGPT credentials are missing or inactive. Sign in on your laptop, then transfer them with bin/chatgpt-login.sh (docs/PLAYBOOK.md §4)." >&2
     exit 1
   fi
 }
@@ -111,7 +157,14 @@ case "${1:-}" in
     compose config "$@"
     ;;
   up|start|run|create)
-    check_secrets
+    starting_hindsight=0
+    if targets_hindsight "$@"; then starting_hindsight=1; fi
+    check_secrets "$starting_hindsight"
+    if [ "$starting_hindsight" = 1 ] && ! is_chatgpt_admin_run "$@" \
+      && [ "$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)" = chatgpt ]; then
+      compose up -d chatgpt-volume-init
+      check_chatgpt_status
+    fi
     compose "$@"
     ;;
   *)

@@ -55,13 +55,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      chatgpt-volume-init:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:${HINDSIGHT_API_HOST_PORT:-8888}:8888"
       - "127.0.0.1:${HINDSIGHT_CP_HOST_PORT:-9999}:9999"
     environment:
       HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in secrets.env}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
-      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
-      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:?set HINDSIGHT_API_LLM_API_KEY in secrets.env}
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-chatgpt}
+      # Optional for chatgpt; bin/hs enforces a nonempty key when starting
+      # hindsight with an API-key provider (Compose cannot guard conditionally).
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-}
+      HINDSIGHT_API_LLM_CHATGPT_HOME: ${HINDSIGHT_API_LLM_CHATGPT_HOME:-/home/hindsight/.hindsight/chatgpt}
       # ApiKeyTenantExtension — confirmed in
       # hindsight_api/extensions/builtin/tenant.py. The value is a
       # module:ClassName import path, not a bare class name.
@@ -77,6 +82,7 @@ services:
       HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:?set HINDSIGHT_CP_ACCESS_KEY in secrets.env}
     volumes:
       - hf_cache:/home/hindsight/.cache/huggingface
+      - chatgpt_credentials:/home/hindsight/.hindsight/chatgpt
     healthcheck:
       # No curl/wget in this image's final stage (confirmed in
       # docker/standalone/Dockerfile — only python:3.11-slim + apt packages
@@ -94,6 +100,16 @@ services:
       start_period: 30s
     logging: *json-rotated
 
+  # New named volumes start root-owned. The app image runs as UID 1000;
+  # token refreshes need write access after the initial credential import.
+  chatgpt-volume-init:
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chown 1000:1000 /chatgpt"]
+    volumes:
+      - chatgpt_credentials:/chatgpt
+
 volumes:
   pgdata:
   # Seeded from the image on first use with the baked-in embedding/reranker
@@ -101,3 +117,4 @@ volumes:
   # Dockerfile's comment on /home/hindsight/.pg0 for why that seeding only
   # works because the path already exists in the image with that owner).
   hf_cache:
+  chatgpt_credentials:
