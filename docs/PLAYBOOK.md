@@ -264,35 +264,56 @@ bin/restore-db.sh r2:db/daily/20260901T010500Z.sql.gz   # key chính xác
 bin/restore-db.sh backups/20260901-120000-manual-db.sql.gz   # file local
 ```
 
-Thứ tự thực hiện (fail-closed — mọi bước fetch/verify chạy TRƯỚC khi đụng
-gì tới DB thật):
+Thứ tự thực hiện (fail-closed — mọi bước fetch/verify/**import thử** chạy
+TRƯỚC khi đụng gì tới DB thật hay dừng app; destructive thật sự chỉ bắt
+đầu từ bước 8):
 
 1. Tải bản dump (hoặc copy file local) vào file tạm.
 2. Verify: không rỗng, `gunzip -t` qua được.
-3. Hỏi xác nhận (bỏ qua bằng `--yes`).
+3. **Validate cấu trúc** (`bin/lib/dump.sh`): phải có đúng header
+   `\restrict <key>` + banner `-- PostgreSQL database dump` + ít nhất một
+   dòng `SET `, và trailer khớp key `\unrestrict <key>` — không chỉ
+   `gunzip -t` (file gzip hợp lệ nhưng toàn rác KHÔNG phải SQL vẫn qua được
+   `gunzip -t`).
 4. **`bin/hs up -d db`** — đảm bảo riêng `db` đang chạy (KHÔNG động vào
    `hindsight`). Đây là restore "lạnh" thật sự: server mới, chưa chạy gì,
-   hoặc đang hồi phục sau sự cố mà không có gì đang chạy — không có bước
-   này, bước 5 dưới sẽ fail vì không `exec` được vào một container chưa
-   tồn tại. Vô hại nếu `db` đã chạy sẵn.
-5. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh
+   hoặc đang hồi phục sau sự cố mà không có gì đang chạy.
+5. **Import thử vào DB tạm `restoretest_<ts>_<pid>`** — đúng logic
+   `--drill` (xem §7): import toàn bộ dump, kiểm 4 bảng cốt lõi. SQL hợp lệ
+   về cú pháp gzip nhưng sai (hoặc dump thiếu bảng cốt lõi) bị bắt NGAY ĐÂY,
+   trước khi DB thật hay `hindsight` bị động tới. Cần đĩa trống ≈ bằng
+   kích thước DB thật (import thêm một bản sao đầy đủ, tạm thời) — kiểm
+   trước khi restore dump lớn:
+   ```bash
+   bin/hs exec -T db psql -U hindsight_user -d hindsight_db \
+     -tAc "SELECT pg_size_pretty(pg_database_size('hindsight_db'));"
+   df -h /var/lib/docker   # hoặc nơi Docker lưu volume trên server bạn
+   ```
+6. Xoá DB tạm (`dropdb`). **Xoá fail cũng dừng script** (không chỉ cảnh
+   báo) — DB thật và `hindsight` vẫn chưa bị đụng, nhưng dropdb fail là
+   dấu hiệu bất thường ở container `db` đáng dừng lại kiểm tra, không nên
+   âm thầm tiếp tục.
+7. Hỏi xác nhận (bỏ qua bằng `--yes`) — chỉ tới đây mới hỏi, sau khi đã
+   biết chắc dump import được.
+8. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh
    stop) — làm TRƯỚC bước backup, không phải sau: backup trước rồi mới
    dừng để lại khoảng hở, ghi dữ liệu giữa hai mốc đó vừa không có trong
-   bản pre-restore vừa mất luôn khi `DROP DATABASE` ở bước 7.
-6. **Backup pre-restore local** — bắt buộc phải thành công, nếu không
+   bản pre-restore vừa mất luôn khi `DROP DATABASE` ở bước 10.
+9. **Backup pre-restore local** — bắt buộc phải thành công, nếu không
    script dừng tại đây (hindsight đã dừng nhưng DB thật chưa bị đụng gì).
-7. `DROP DATABASE ... WITH (FORCE); CREATE DATABASE ...`
-8. Restore (`psql -1 -f -` — một transaction, lỗi giữa đường thì rollback
-   toàn bộ, không để DB ở trạng thái nửa vời).
-9. `bin/hs up -d hindsight` + `bin/hs ready` — dùng `up -d`, không phải
-   `start`, vì `start` chỉ khởi động được container ĐÃ TỒN TẠI; sau `hs down`
-   hoặc trên server chưa từng chạy, container đó chưa được tạo, `start` sẽ
-   im lặng không làm gì và `hs ready` sẽ timeout vào chỗ không có gì đang
-   chạy. Bỏ qua bước này bằng `--no-start`, dùng trong rollback của
-   `upgrade.sh` — image cũ tự lên lại ở bước sau.
+10. `DROP DATABASE ... WITH (FORCE); CREATE DATABASE ...`
+11. Restore (`psql -1 -f -` — một transaction, lỗi giữa đường thì rollback
+    toàn bộ, không để DB ở trạng thái nửa vời — dù ở điểm này gần như không
+    thể fail nữa, vì bước 5 đã chứng minh đúng bản dump này import sạch).
+12. `bin/hs up -d hindsight` + `bin/hs ready` — dùng `up -d`, không phải
+    `start`, vì `start` chỉ khởi động được container ĐÃ TỒN TẠI; sau `hs down`
+    hoặc trên server chưa từng chạy, container đó chưa được tạo, `start` sẽ
+    im lặng không làm gì và `hs ready` sẽ timeout vào chỗ không có gì đang
+    chạy. Bỏ qua bước này bằng `--no-start`, dùng trong rollback của
+    `upgrade.sh` — image cũ tự lên lại ở bước sau.
 
-Nếu bước 8 fail: hindsight **không** được start lại, script in sẵn lệnh
-restore lại từ bản pre-restore vừa tạo ở bước 6.
+Nếu bước 11 fail: hindsight **không** được start lại, script in sẵn lệnh
+restore lại từ bản pre-restore vừa tạo ở bước 9.
 
 ---
 

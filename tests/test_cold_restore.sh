@@ -63,12 +63,16 @@ case "\$1" in
 -- PostgreSQL database dump
 --
 
+\restrict FAKEKEY00000000000000000000000000000000000000000000000000000
+
 SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
 
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict FAKEKEY00000000000000000000000000000000000000000000000000000
 SQL
         exit 0 ;;
     esac
@@ -100,12 +104,16 @@ cat > "$TMP/fixture-dump.sql" <<'SQL'
 -- PostgreSQL database dump
 --
 
+\restrict FAKEKEY00000000000000000000000000000000000000000000000000000
+
 SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
 
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict FAKEKEY00000000000000000000000000000000000000000000000000000
 SQL
 gzip -c "$TMP/fixture-dump.sql" > "$TMP/fixture-dump.sql.gz"
 

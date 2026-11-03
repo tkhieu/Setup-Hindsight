@@ -152,12 +152,16 @@ cat > "$T2/fixture-dump.sql" <<'SQL'
 -- PostgreSQL database dump
 --
 
+\restrict FAKEKEY00000000000000000000000000000000000000000000000000000
+
 SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
 
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict FAKEKEY00000000000000000000000000000000000000000000000000000
 SQL
 gzip -c "$T2/fixture-dump.sql" > "$T2/fixture-dump.sql.gz"
 

@@ -24,7 +24,22 @@ cat > "$TMP/bin/hs" <<'EOF'
 #!/bin/sh
 case "$1" in
   exec)
-    printf '%s\n' "-- fake pg_dump content --" "--" "-- PostgreSQL database dump complete" "--"
+    cat <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+\restrict FAKEKEY00000000000000000000000000000000000000000000000000000
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+
+--
+-- PostgreSQL database dump complete
+--
+
+\unrestrict FAKEKEY00000000000000000000000000000000000000000000000000000
+SQL
     exit 0 ;;
   *) exit 0 ;;
 esac

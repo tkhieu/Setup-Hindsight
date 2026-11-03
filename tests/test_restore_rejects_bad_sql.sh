@@ -80,6 +80,8 @@ cat > "$TMP/bad.sql" <<'SQL'
 -- PostgreSQL database dump
 --
 
+\restrict FAKEKEY00000000000000000000000000000000000000000000000000000
+
 SET statement_timeout = 0;
 SET client_encoding = 'UTF8';
 
@@ -88,6 +90,8 @@ SIMULATED_SQL_SYNTAX_ERROR THIS IS NOT VALID SQL;
 --
 -- PostgreSQL database dump complete
 --
+
+\unrestrict FAKEKEY00000000000000000000000000000000000000000000000000000
 SQL
 gzip -c "$TMP/bad.sql" > "$TMP/bad.sql.gz"
 

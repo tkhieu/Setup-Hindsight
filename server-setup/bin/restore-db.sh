@@ -310,8 +310,17 @@ if ! trial_import_and_check; then
   exit 1
 fi
 echo "Trial import OK — the live database and hindsight are still untouched; proceeding with the real restore."
+# A failed drop here must ABORT, not just warn-and-continue: proceeding
+# anyway would still be safe for the live database (nothing destructive
+# has happened to it yet either way), but silently continuing past an
+# unexplained dropdb failure is itself a bad sign about the db container
+# worth stopping for, and TRIAL_CREATED stays 1 (not cleared below) so the
+# EXIT trap's own cleanup still gets a second attempt at dropping it
+# instead of this throwaway database being quietly orphaned.
 if ! "$HS" exec -T db dropdb -U "$DB_USER" --if-exists "$TRIAL_DB"; then
-  echo "WARNING: could not drop trial db $TRIAL_DB — drop it manually: hs exec -T db dropdb -U $DB_USER $TRIAL_DB" >&2
+  echo "ERROR: could not drop trial database $TRIAL_DB after a successful trial import — aborting before touching the live database or app." >&2
+  echo "       Investigate, then drop it manually: hs exec -T db dropdb -U $DB_USER $TRIAL_DB" >&2
+  exit 1
 fi
 TRIAL_CREATED=0
 
