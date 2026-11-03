@@ -32,6 +32,11 @@ REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 UPSTREAM_REPO="vectorize-io/hindsight"
 ISSUE_REPO="tkhieu/Setup-Hindsight"
 LABEL="hindsight-upgrade"
+# Generous but FINITE bound on git fetch/push below — every curl call here
+# already carries its own --max-time/--connect-timeout. See docs/PLAYBOOK.md
+# §8b (same reasoning as bin/upgrade.sh's PULL_TIMEOUT/BACKUP_TIMEOUT/
+# RESTORE_TIMEOUT: TimeoutStartSec=infinity trusts these, not systemd).
+GIT_TIMEOUT="${HINDSIGHT_GIT_TIMEOUT:-60}"
 
 DRY_RUN=0
 case "${1:-}" in
@@ -79,11 +84,11 @@ header = "X-GitHub-Api-Version: 2022-11-28"'
 header = \"Authorization: Bearer $esc\""
   fi
   if [ -n "$bodyfile" ]; then
-    out="$(printf '%s\n' "$cfg" | curl -sS --max-time 30 -w '\n%{http_code}' -K - \
+    out="$(printf '%s\n' "$cfg" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -K - \
       -X "$method" -H 'Content-Type: application/json' --data-binary "@$bodyfile" \
       "https://api.github.com$path")"
   else
-    out="$(printf '%s\n' "$cfg" | curl -sS --max-time 30 -w '\n%{http_code}' -K - \
+    out="$(printf '%s\n' "$cfg" | curl -sS --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -K - \
       -X "$method" "https://api.github.com$path")"
   fi
   GH_API_STATUS="${out##*$'\n'}"
@@ -96,11 +101,11 @@ header = \"Authorization: Bearer $esc\""
 # manifest check (-o /dev/null, we only care about the status code).
 ghcr_tag_exists() {  # ghcr_tag_exists <bare-version, e.g. 1.2.1>
   local token status
-  token="$(curl -fsS --max-time 15 \
+  token="$(curl -fsS --connect-timeout 10 --max-time 15 \
     "https://ghcr.io/token?scope=repository:vectorize-io/hindsight:pull" | json_str token)"
   [ -n "$token" ] || return 1
   status="$(printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json"\n' "$token" \
-    | curl -s --max-time 15 -o /dev/null -w '%{http_code}' -K - \
+    | curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w '%{http_code}' -K - \
       "https://ghcr.io/v2/vectorize-io/hindsight/manifests/$1")"
   [ "$status" = 200 ]
 }
@@ -132,8 +137,8 @@ git_ready_for_autoupgrade() {
     echo "not on branch main (currently on '$branch')" >&2
     return 1
   fi
-  if ! git -C "$REPO_ROOT" fetch --quiet origin main; then
-    echo "git fetch origin main failed" >&2
+  if ! timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" fetch --quiet origin main; then
+    echo "git fetch origin main failed (or exceeded ${GIT_TIMEOUT}s)" >&2
     return 1
   fi
   local_sha="$(git -C "$REPO_ROOT" rev-parse main)"
@@ -169,7 +174,18 @@ ensure_label() {  # returns 0 if the label exists (created now or already), 1 on
   gh_api POST "/repos/$ISSUE_REPO/labels" "$bodyfile"
   rm -f "$bodyfile"
   case "$GH_API_STATUS" in
-    201 | 422) return 0 ;; # 422 = label already exists
+    201) return 0 ;;
+    422)
+      # Only a REAL "already exists" 422 (errors[].code == "already_exists")
+      # is harmless — GitHub returns 422 for other validation failures too
+      # (e.g. a bad color/name), and treating every 422 as "fine, it already
+      # exists" would silently swallow those instead of failing loud.
+      if printf '%s' "$GH_API_BODY" | json_has_error_code already_exists; then
+        return 0
+      fi
+      echo "ERROR: label create for '$LABEL' returned 422 but not 'already_exists' (HTTP 422): $GH_API_BODY" >&2
+      return 1
+      ;;
     *) echo "ERROR: could not ensure label '$LABEL' exists (HTTP $GH_API_STATUS): $GH_API_BODY" >&2; return 1 ;;
   esac
 }
@@ -187,7 +203,10 @@ find_issue_by_title() {
       echo "ERROR: listing '$LABEL' issues (page $page) failed (HTTP $GH_API_STATUS): $GH_API_BODY" >&2
       return 1
     fi
-    len="$(printf '%s' "$GH_API_BODY" | json_array_len)"
+    len="$(printf '%s' "$GH_API_BODY" | json_array_len)" || {
+      echo "ERROR: listing '$LABEL' issues (page $page) returned HTTP 200 but a malformed/non-array body: $GH_API_BODY" >&2
+      return 1
+    }
     [ "$len" -gt 0 ] || break
     num="$(printf '%s' "$GH_API_BODY" | json_array_find_number title "$title")"
     if [ -n "$num" ]; then
@@ -290,7 +309,8 @@ if [ "$cmp" = patch ]; then
   if [ "$DRY_RUN" = 1 ]; then
     echo "[dry-run] would run: bin/upgrade.sh --yes --auto-rollback --smoke $ver"
     echo "[dry-run] on success: commit+push server-setup/version.env, open issue 'Hindsight auto-upgraded to $ver'"
-    echo "[dry-run] on failure: open issue 'Hindsight auto-upgrade to $ver failed (rolled back)'"
+    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' or '...failed before changing anything (restarted OK)', depending on whether a pre-upgrade dump was ever taken"
+    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3, or push failing after a healthy upgrade): open the matching '...manual action needed' or '...push failed' issue instead"
     exit 0
   fi
 
@@ -321,7 +341,7 @@ Manual upgrade (after fixing the repo state above), run on the server from serve
         git -C "$REPO_ROOT" commit -m "chore: bump Hindsight to $ver" || push_ok=0
       fi
       if [ "$push_ok" = 1 ]; then
-        git -C "$REPO_ROOT" push origin main || push_ok=0
+        timeout "$GIT_TIMEOUT" git -C "$REPO_ROOT" push origin main || push_ok=0
       fi
 
       if [ "$push_ok" = 1 ]; then
@@ -336,16 +356,16 @@ $notes_excerpt"
         # Upgrade itself is healthy and running $ver — only the repo update
         # failed. Nothing to roll back; this is a git problem, not a
         # hindsight problem, so bin/upgrade.sh's own rollback is never
-        # involved here.
-        echo "ERROR: commit/push of version.env failed after a successful upgrade to $ver — hindsight is healthy on $ver, but the repo on the server was not updated." >&2
-        body="Hindsight was upgraded to $ver and passed its smoke test — it is healthy and running $ver right now. Committing/pushing version.env on the server afterward FAILED, so the repo still shows $CUR. Nothing needs to be rolled back.
+        # involved here. The LOCAL commit above already landed (only the
+        # push failed) — the fix is pull+push, NEVER a second commit.
+        echo "ERROR: push of version.env failed after a successful upgrade to $ver — hindsight is healthy on $ver, but the commit on the server has not reached origin/main yet." >&2
+        body="Hindsight was upgraded to $ver and passed its smoke test — it is healthy and running $ver right now. The commit bumping version.env to $ver already exists LOCALLY on the server; only pushing it to origin/main afterward FAILED. Nothing needs to be rolled back, and do NOT create a second commit.
 
 Fix manually on the server:
-  cd $REPO_ROOT
-  git status
-  git add server-setup/version.env
-  git commit -m \"chore: bump Hindsight to $ver\"
-  git push origin main
+  git -C $REPO_ROOT status
+  git -C $REPO_ROOT log origin/main..HEAD
+  git -C $REPO_ROOT pull --rebase origin main   # or resolve any conflict by hand
+  git -C $REPO_ROOT push origin main
 
 Release: $html_url"
         rm -f "$LOG"
@@ -354,33 +374,56 @@ Release: $html_url"
       fi
       ;;
     2)
-      # upgrade.sh --auto-rollback: upgrade failed, but the rollback itself
-      # succeeded — hindsight is back on $CUR and healthy.
-      echo "upgrade.sh failed but auto-rollback succeeded (back on $CUR) — see the log tail in the issue being opened now." >&2
-      body="Automatic upgrade of Hindsight $CUR -> $ver FAILED and was automatically rolled back to $CUR by bin/upgrade.sh --auto-rollback — hindsight is back on $CUR and healthy. version.env was NOT changed; nothing was committed or pushed.
+      # upgrade.sh exits 2 for two distinct, both-VERIFIED-healthy cases:
+      # a real auto-rollback that succeeded (a pre-upgrade dump exists —
+      # the "pre-upgrade dump: ..." line is only ever printed after that
+      # backup step completes), or a failure BEFORE version.env was ever
+      # bumped (pull/stop/backup itself) where upgrade.sh just verified
+      # hindsight is still fine on $CUR (no dump needed). `|| true`: no
+      # match is a normal, expected outcome here, not a pipeline error (see
+      # bin/upgrade.sh's own `set -euo pipefail` note on this same grep).
+      pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')" || true
+      if [ -n "$pre_dump" ]; then
+        echo "upgrade.sh failed but auto-rollback succeeded and was VERIFIED (back on $CUR) — see the log tail in the issue being opened now." >&2
+        title="Hindsight auto-upgrade to $ver failed (rolled back)"
+        body="Automatic upgrade of Hindsight $CUR -> $ver FAILED and was automatically rolled back to $CUR by bin/upgrade.sh --auto-rollback — VERIFIED back on $CUR and healthy (version.env pin + the running container's image + /health all checked). version.env was NOT changed; nothing was committed or pushed.
 
 Release: $html_url
 
 --- log tail (secrets redacted) ---
 $(redact_log "$LOG" | tail -n 100)"
+      else
+        echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was restarted and VERIFIED healthy on $CUR." >&2
+        title="Hindsight auto-upgrade to $ver failed before changing anything (restarted OK)"
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (the image pull, stopping hindsight, or the pre-upgrade backup itself) — nothing in the database was touched, no dump was needed, and bin/upgrade.sh VERIFIED hindsight is still healthy on $CUR (version.env pin + the running container's image + /health all checked).
+
+Release: $html_url
+
+--- log tail (secrets redacted) ---
+$(redact_log "$LOG" | tail -n 100)"
+      fi
       rm -f "$LOG"
-      open_or_dedupe_issue "Hindsight auto-upgrade to $ver failed (rolled back)" "$body" || true
+      open_or_dedupe_issue "$title" "$body" || true
       exit 1
       ;;
     *)
-      # Anything else (3 = the rollback ITSELF failed, or any unexpected
-      # code) is treated as the worst case on purpose: hindsight's actual
-      # state is unknown/bad and needs a human NOW.
-      pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')"
-      echo "upgrade.sh failed AND auto-rollback failed (exit $upgrade_rc) — manual action needed now." >&2
-      body="Automatic upgrade of Hindsight $CUR -> $ver FAILED, and the automatic rollback ALSO failed (bin/upgrade.sh exit $upgrade_rc). Hindsight's state on the server is UNKNOWN/BAD — this needs manual action now.
+      # Anything else (3 = the verified-recovery check ITSELF failed, or
+      # any unexpected code) is treated as the worst case on purpose:
+      # hindsight's actual state is unknown/bad and needs a human NOW. Same
+      # dump-present/absent split as exit 2 above decides whether a real
+      # rollback (with a dump to restore) or just a restart was attempted.
+      pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')" || true
+      echo "upgrade.sh failed and the recovery could not be VERIFIED (exit $upgrade_rc) — manual action needed now." >&2
+      if [ -n "$pre_dump" ]; then
+        title="Hindsight auto-upgrade to $ver failed AND rollback failed — manual action needed"
+        body="Automatic upgrade of Hindsight $CUR -> $ver FAILED, and the automatic rollback could NOT be verified (bin/upgrade.sh exit $upgrade_rc). Hindsight's state on the server is UNKNOWN/BAD — this needs manual action now.
 
-Pre-upgrade dump: ${pre_dump:-see the log tail below}
+Pre-upgrade dump: $pre_dump
 
 Manual restore (docs/PLAYBOOK.md §6/§8), run on the server from server-setup/:
   bin/hs stop hindsight
   sed -i 's|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|' version.env
-  bin/restore-db.sh --yes --no-start ${pre_dump:-<pre-upgrade dump>}
+  bin/restore-db.sh --yes --no-start $pre_dump
   bin/hs up -d
   bin/hs ready
 
@@ -388,8 +431,22 @@ Release: $html_url
 
 --- log tail (secrets redacted) ---
 $(redact_log "$LOG" | tail -n 100)"
+      else
+        title="Hindsight auto-upgrade to $ver failed before changing anything AND the restart could not be verified — manual action needed"
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened, and bin/upgrade.sh could NOT verify hindsight is healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check and restart manually:
+  cd $CONFIG_DIR
+  bin/hs ps
+  bin/hs up -d
+  bin/hs ready
+  bin/hs logs hindsight
+
+Release: $html_url
+
+--- log tail (secrets redacted) ---
+$(redact_log "$LOG" | tail -n 100)"
+      fi
       rm -f "$LOG"
-      open_or_dedupe_issue "Hindsight auto-upgrade to $ver failed AND rollback failed — manual action needed" "$body" || true
+      open_or_dedupe_issue "$title" "$body" || true
       exit 1
       ;;
   esac

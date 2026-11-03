@@ -60,7 +60,7 @@ case "$url" in
   *"api.github.com/repos/vectorize-io/hindsight/releases/latest")
     printf '%s\n%s' "${RELEASE_BODY:-}" "${RELEASE_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/labels")
-    printf '%s\n%s' "" "${LABEL_STATUS:-201}" ;;
+    printf '%s\n%s' "${LABEL_BODY:-}" "${LABEL_STATUS:-201}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/issues?"*"page=2"*)
     printf '%s\n%s' "${ISSUES_LIST_BODY_PAGE2:-[]}" "${ISSUES_LIST_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/issues?"*)
@@ -341,8 +341,9 @@ CREATED_ISSUE_LOG_9="$T9/created_issue.json"
 cat > "$T9/repo/server-setup/bin/upgrade.sh" <<EOF
 #!/bin/sh
 echo "\$*" >> "$UPGRADE_LOG_9"
+echo "pre-upgrade dump (hindsight was already stopped when this was taken): $T9/fake-pre-1.1.0.sql.gz"
 echo "fake upgrade.sh: NOT ready after 5 minutes" >&2
-echo "AUTO-ROLLBACK OK — hindsight is back on 1.1.0 and healthy." >&2
+echo "AUTO-ROLLBACK OK — hindsight is back on 1.1.0 and healthy (verified version.env + image + /health)." >&2
 exit 2
 EOF
 chmod +x "$T9/repo/server-setup/bin/upgrade.sh"
@@ -528,8 +529,17 @@ grep -q '"title":"Hindsight auto-upgraded to 1.1.1 but version.env push failed"'
   || { echo "FAIL: missing the push-failed issue:"; cat "$CREATED_ISSUE_LOG_13"; exit 1; }
 printf '%s\n' "$out13" "$(cat "$CREATED_ISSUE_LOG_13")" | grep -qi "AUTO-ROLLBACK" \
   && { echo "FAIL: a push failure after a healthy upgrade must never mention a rollback"; exit 1; }
+# The commit already exists locally (only the push failed) — the fix is
+# pull+push, never a second commit. The issue body must say exactly that,
+# and must NEVER tell the operator to `git commit` again.
+grep -q "pull --rebase origin main" "$CREATED_ISSUE_LOG_13" \
+  || { echo "FAIL: expected the issue to say 'git pull --rebase origin main':"; cat "$CREATED_ISSUE_LOG_13"; exit 1; }
+grep -qi "do NOT create a second commit\|NEVER.*second commit\|already exists LOCALLY" "$CREATED_ISSUE_LOG_13" \
+  || { echo "FAIL: expected the issue to say the commit already exists locally / no second commit:"; cat "$CREATED_ISSUE_LOG_13"; exit 1; }
+grep -qi "git commit" "$CREATED_ISSUE_LOG_13" \
+  && { echo "FAIL: push-failure recovery text must never instruct a second 'git commit':"; cat "$CREATED_ISSUE_LOG_13"; exit 1; }
 rm -rf "$T13"
-echo "ok - upgrade succeeds but push fails: push-failed issue, no rollback, non-zero exit"
+echo "ok - upgrade succeeds but push fails: push-failed issue, no rollback, no second commit, non-zero exit"
 
 # ============================================================================
 # Scenario: python3 missing from PATH -> check-upstream.sh fails loud,
@@ -560,3 +570,98 @@ printf '%s\n' "$out15" | grep -qi "python3 is required" \
 [ -e "$T15/.ops.lock" ] && { echo "FAIL: the lock file was created despite failing before lock acquisition"; exit 1; }
 rm -rf "$T15"
 echo "ok - missing python3 -> fails loud immediately"
+
+# ============================================================================
+# Scenario: the issue-listing API returns HTTP 200 but a malformed/non-array
+# body (not valid JSON at all) -> treated as an error, NOT as "0 issues
+# found" — no issue created, exit non-zero. Reuses the minor-release path.
+# ============================================================================
+T16="$(mktemp -d)"
+setup_minimal "$T16" 1.1.0
+printf 'GITHUB_ISSUE_TOKEN=test-token\n' > "$T16/secrets.env"
+CREATED_ISSUE_LOG_16="$T16/created_issue.json"
+: > "$CREATED_ISSUE_LOG_16"
+RELEASE_BODY="$(rel_json v1.2.0)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_16" ISSUES_LIST_BODY='this is not json at all'
+set +e
+out16="$(run_minimal "$T16" 2>&1)"
+rc16=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG ISSUES_LIST_BODY
+
+[ "$rc16" -ne 0 ] || { echo "$out16"; echo "FAIL: expected a non-zero exit on a malformed issue-list body"; exit 1; }
+[ -s "$CREATED_ISSUE_LOG_16" ] && { echo "FAIL: an issue was created despite a malformed issue-list body:"; cat "$CREATED_ISSUE_LOG_16"; exit 1; }
+printf '%s\n' "$out16" | grep -qi "malformed" \
+  || { echo "$out16"; echo "FAIL: expected a clear 'malformed' error"; exit 1; }
+rm -rf "$T16"
+echo "ok - malformed/non-array issue-list body -> treated as an error, no issue created"
+
+# ============================================================================
+# Scenario: label create returns HTTP 422, but for a reason OTHER than
+# "already exists" (e.g. an invalid color) -> must fail, not be treated as
+# "the label already exists". Reuses the minor-release path.
+# ============================================================================
+T17="$(mktemp -d)"
+setup_minimal "$T17" 1.1.0
+printf 'GITHUB_ISSUE_TOKEN=test-token\n' > "$T17/secrets.env"
+CREATED_ISSUE_LOG_17="$T17/created_issue.json"
+: > "$CREATED_ISSUE_LOG_17"
+RELEASE_BODY="$(rel_json v1.2.0)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_17" LABEL_STATUS=422 \
+  LABEL_BODY='{"message":"Validation Failed","errors":[{"resource":"Label","code":"invalid","field":"color"}]}'
+set +e
+out17="$(run_minimal "$T17" 2>&1)"
+rc17=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG LABEL_STATUS LABEL_BODY
+
+[ "$rc17" -ne 0 ] || { echo "$out17"; echo "FAIL: expected a non-zero exit on a non-already_exists 422"; exit 1; }
+[ -s "$CREATED_ISSUE_LOG_17" ] && { echo "FAIL: an issue was created despite the label create failing:"; cat "$CREATED_ISSUE_LOG_17"; exit 1; }
+printf '%s\n' "$out17" | grep -qi "not 'already_exists'" \
+  || { echo "$out17"; echo "FAIL: expected a clear '...not already_exists...' error"; exit 1; }
+rm -rf "$T17"
+echo "ok - 422 label create NOT already_exists -> fails, no issue created"
+
+# ============================================================================
+# Scenario: patch available, upgrade.sh exits 2 but WITHOUT ever taking a
+# pre-upgrade dump (simulating a pull/stop/backup failure BEFORE the
+# version bump — see bin/upgrade.sh's VERSION_BUMPED=0 recovery path) ->
+# the distinct "failed before changing anything (restarted OK)" issue, NOT
+# the "(rolled back)" one (there was nothing to roll back), exit non-zero.
+# ============================================================================
+T18="$(mktemp -d)"
+setup_git "$T18" 1.1.0
+UPGRADE_LOG_18="$T18/upgrade.log"
+CREATED_ISSUE_LOG_18="$T18/created_issue.json"
+: > "$UPGRADE_LOG_18"
+: > "$CREATED_ISSUE_LOG_18"
+cat > "$T18/repo/server-setup/bin/upgrade.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$UPGRADE_LOG_18"
+echo "fake upgrade.sh: image pull failed" >&2
+echo "hindsight restarted on 1.1.0 and VERIFIED healthy (version.env + image + /health)." >&2
+exit 2
+EOF
+chmod +x "$T18/repo/server-setup/bin/upgrade.sh"
+git -C "$T18/repo" add -A
+git -C "$T18/repo" commit -q -m "add fake upgrade.sh"
+git -C "$T18/repo" push -q origin main
+
+BEFORE_SHA_18="$(git -C "$T18/repo" rev-parse main)"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_18"
+set +e
+out18="$(run_git "$T18" 2>&1)"
+rc18=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG
+
+[ "$rc18" -ne 0 ] || { echo "$out18"; echo "FAIL: expected a non-zero exit"; exit 1; }
+[ "$(git -C "$T18/repo" rev-parse main)" = "$BEFORE_SHA_18" ] \
+  || { echo "FAIL: a commit was made on main despite upgrade.sh failing before any version bump"; exit 1; }
+grep -q '"title":"Hindsight auto-upgrade to 1.1.1 failed before changing anything (restarted OK)"' "$CREATED_ISSUE_LOG_18" \
+  || { echo "FAIL: missing the before-bump restarted-OK issue:"; cat "$CREATED_ISSUE_LOG_18"; exit 1; }
+grep -qi "rolled back" "$CREATED_ISSUE_LOG_18" \
+  && { echo "FAIL: nothing was ever bumped, so this issue must never say 'rolled back':"; cat "$CREATED_ISSUE_LOG_18"; exit 1; }
+rm -rf "$T18"
+echo "ok - upgrade.sh exit 2 with no pre-upgrade dump -> 'failed before changing anything (restarted OK)' issue"

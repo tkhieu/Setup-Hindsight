@@ -143,7 +143,16 @@ echo "\$*" >> "$HS_LOG_B"
 case "\$1" in
   pull) exit 0 ;;
   stop) exit 0 ;;
-  ps) exit 0 ;;
+  ps)
+    shift
+    case "\$*" in
+      # verify_on_version's image check: report whatever version.env
+      # currently pins, same as a real running container would after a
+      # real \`hs up -d\` against that env file.
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TB/version.env" | cut -d= -f2)" ;;
+      *) ;;  # --services --status running -> nothing running (stop verified)
+    esac
+    exit 0 ;;
   exec)
     shift
     case "\$*" in
@@ -237,3 +246,166 @@ printf '%s\n' "$outC" | grep -qi "restore-db.sh failed" || { echo "$outC"; echo 
 
 rm -rf "$TC"
 echo "ok - upgrade.sh --auto-rollback exits 3 when the rollback itself fails"
+
+# ============================================================================
+# Scenario D: the rollback's OWN `sed -i` (reverting version.env to the old
+# version) fails. Before this fix, do_auto_rollback ran that sed unchecked
+# (inside an `if`, where set -e is suspended) and would go on to print
+# "AUTO-ROLLBACK OK" / exit 2 even though version.env still pinned the new
+# version. Must now exit 3 and never claim success. A fake `sed` on PATH
+# fails only the revert-to-old-version invocation; the step-5 bump (to the
+# NEW version) must still go through normally via the real sed.
+# ============================================================================
+TD="$(mktemp -d)"
+setup_common "$TD"
+mkdir -p "$TD/fakebin"
+
+REAL_SED="$(command -v sed)"
+cat > "$TD/fakebin/sed" <<EOF
+#!/bin/sh
+case "\$*" in
+  *"HINDSIGHT_VERSION=1.1.0"*) echo "fake sed: simulated failure reverting version.env" >&2; exit 1 ;;
+  *) exec "$REAL_SED" "\$@" ;;
+esac
+EOF
+chmod +x "$TD/fakebin/sed"
+
+HS_LOG_D="$TD/hs.log"
+: > "$HS_LOG_D"
+
+cat > "$TD/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_D"
+case "\$1" in
+  pull) exit 0 ;;
+  stop) exit 0 ;;
+  ps) exit 0 ;;
+  exec)
+    shift
+    case "\$*" in
+      *pg_dump*) cat "$TD/fixture.sql" ;;
+    esac
+    exit 0 ;;
+  up) exit 1 ;;  # new version never comes up -> triggers rollback
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TD/bin/hs"
+
+cd "$TD"
+set +e
+outD="$(PATH="$TD/fakebin:$TD/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcD=$?
+set -e
+cd "$HERE"
+
+[ "$rcD" -eq 3 ] || { echo "$outD"; echo "FAIL: expected upgrade.sh to exit 3 when the rollback's own sed fails, got $rcD"; exit 1; }
+printf '%s\n' "$outD" | grep -q "AUTO-ROLLBACK OK" && { echo "$outD"; echo "FAIL: must not claim 'AUTO-ROLLBACK OK' when reverting version.env failed"; exit 1; }
+printf '%s\n' "$outD" | grep -qi "could not revert version.env" || { echo "$outD"; echo "FAIL: missing the version.env-revert-failed error"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.1$' "$TD/version.env" \
+  || { echo "FAIL: expected version.env to still read the FAILED-to-revert new version 1.1.1:"; cat "$TD/version.env"; exit 1; }
+
+rm -rf "$TD"
+echo "ok - upgrade.sh --auto-rollback exits 3 when the rollback's own sed silently fails"
+
+# ============================================================================
+# Scenario E: the image pull itself fails, before anything was stopped or
+# touched. Must exit 2 (not the old bare untrapped exit 1) after verifying
+# hindsight is still fine on the unchanged CUR version — no pre-upgrade
+# dump needed, nothing was ever stopped.
+# ============================================================================
+TE="$(mktemp -d)"
+setup_common "$TE"
+
+HS_LOG_E="$TE/hs.log"
+: > "$HS_LOG_E"
+
+cat > "$TE/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_E"
+case "\$1" in
+  pull) exit 1 ;;  # cold pull / network failure
+  ps)
+    shift
+    case "\$*" in
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TE/version.env" | cut -d= -f2)" ;;
+      *) ;;
+    esac
+    exit 0 ;;
+  up) exit 0 ;;
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TE/bin/hs"
+
+cd "$TE"
+set +e
+outE="$(PATH="$TE/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcE=$?
+set -e
+cd "$HERE"
+
+[ "$rcE" -eq 2 ] || { echo "$outE"; echo "FAIL: expected upgrade.sh to exit 2 after a pull failure (restart verified), got $rcE"; exit 1; }
+printf '%s\n' "$outE" | grep -qi "VERIFIED healthy" || { echo "$outE"; echo "FAIL: missing the verified-healthy restart message"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TE/version.env" \
+  || { echo "FAIL: version.env must be unchanged (still 1.1.0) after a pull failure:"; cat "$TE/version.env"; exit 1; }
+
+rm -rf "$TE"
+echo "ok - upgrade.sh exits 2 (restart verified) when the image pull itself fails"
+
+# ============================================================================
+# Scenario F: the pre-upgrade backup fails AFTER hindsight was already
+# stopped (fake `hs exec ... pg_dump` fails). Must restart hindsight on the
+# unchanged CUR version, VERIFY it, and exit 2 — same contract as a pull
+# failure, just one step later and with something to actually restart.
+# ============================================================================
+TF="$(mktemp -d)"
+setup_common "$TF"
+
+HS_LOG_F="$TF/hs.log"
+: > "$HS_LOG_F"
+
+cat > "$TF/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_F"
+case "\$1" in
+  pull) exit 0 ;;
+  stop) exit 0 ;;
+  ps)
+    shift
+    case "\$*" in
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TF/version.env" | cut -d= -f2)" ;;
+      *) ;;
+    esac
+    exit 0 ;;
+  exec)
+    shift
+    case "\$*" in
+      *pg_dump*) echo "fake pg_dump: connection to database failed" >&2; exit 1 ;;
+    esac
+    exit 0 ;;
+  up) exit 0 ;;
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TF/bin/hs"
+
+cd "$TF"
+set +e
+outF="$(PATH="$TF/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcF=$?
+set -e
+cd "$HERE"
+
+[ "$rcF" -eq 2 ] || { echo "$outF"; echo "FAIL: expected upgrade.sh to exit 2 after a post-stop backup failure (restart verified), got $rcF"; exit 1; }
+printf '%s\n' "$outF" | grep -qi "VERIFIED healthy" || { echo "$outF"; echo "FAIL: missing the verified-healthy restart message"; exit 1; }
+grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TF/version.env" \
+  || { echo "FAIL: version.env must be unchanged (still 1.1.0) after a backup failure:"; cat "$TF/version.env"; exit 1; }
+[ -z "$(find "$TF/backups" -maxdepth 1 -name '*-db.sql.gz' 2>/dev/null)" ] \
+  || { echo "FAIL: no real dump should exist — pg_dump itself failed"; exit 1; }
+
+rm -rf "$TF"
+echo "ok - upgrade.sh exits 2 (restart verified) when the backup fails after hindsight was stopped"

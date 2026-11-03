@@ -12,13 +12,21 @@
 #                   hindsight, revert version.env to the old version, restore
 #                   the exact pre-upgrade dump via bin/restore-db.sh --yes
 #                   --no-start, start hindsight back up on the old version
-#                   and verify /health. Exit code distinguishes the outcome:
-#                     2 = upgrade failed, but the rollback itself succeeded
-#                         (hindsight is back on the OLD version and healthy)
-#                     3 = the rollback ALSO failed (unknown/bad state —
+#                   and VERIFY it (version.env pin + the running container's
+#                   own image tag + /health). A failure BEFORE version.env
+#                   was bumped (pull, stop, or the pre-upgrade backup itself)
+#                   never needed a dump-restore rollback — it just restarts
+#                   hindsight on the unchanged old version and verifies the
+#                   same way. Either way, exit code distinguishes the
+#                   outcome:
+#                     2 = upgrade failed, but hindsight is VERIFIED healthy
+#                         on the OLD version afterward (whether that took a
+#                         real auto-rollback, or just a restart because
+#                         nothing had changed yet)
+#                     3 = that verification FAILED (unknown/bad state —
 #                         manual action needed now; see the log for exactly
-#                         which rollback step failed and the pre-upgrade
-#                         dump path)
+#                         which step failed, and the pre-upgrade dump path
+#                         if one was taken)
 #                   Without --auto-rollback, a failure after version.env was
 #                   bumped keeps exiting 1 (unchanged) and only prints the
 #                   rollback commands instead of running them.
@@ -39,6 +47,15 @@ REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/lock.sh"
 HS="$CONFIG_DIR/bin/hs"
+
+# Generous but FINITE bounds on the steps below that can otherwise hang
+# indefinitely while this script holds the shared ops lock (bin/lib/lock.sh)
+# — hindsight-upgrade-check.service has TimeoutStartSec=infinity precisely
+# because it trusts these, not systemd, to eventually give up. See
+# docs/PLAYBOOK.md §8b.
+PULL_TIMEOUT="${HINDSIGHT_PULL_TIMEOUT:-600}"       # cold docker image pull
+BACKUP_TIMEOUT="${HINDSIGHT_BACKUP_TIMEOUT:-900}"   # bin/backup.sh / bin/backup-r2.sh
+RESTORE_TIMEOUT="${HINDSIGHT_RESTORE_TIMEOUT:-900}" # bin/restore-db.sh, auto-rollback
 
 YES=0
 AUTO_ROLLBACK=0
@@ -92,21 +109,19 @@ if [ "$YES" != 1 ]; then
   ask "Diff above OK — continue upgrading $CUR -> $NEW?" || { echo "aborted (nothing changed yet)."; exit 1; }
 fi
 
-say "2/7 Pull target image ($NEW) before changing anything"
-# Via shell env override (Compose gives shell env precedence over
-# --env-file for interpolation), NOT version.env yet: a bad version or
-# network failure here leaves the running stack and version.env untouched,
-# so there is nothing to roll back and no trap is needed above this line.
-HINDSIGHT_VERSION="$NEW" "$HS" pull hindsight
-
-# From here on, stopping the app is itself a state change worth recovering
-# from automatically — arm the trap NOW, before the stop below, not after
-# the backup that follows it. A failure anywhere from here on (stop itself,
-# the backup, or anything after) must not exit silently and leave hindsight
-# down with no guidance. VERSION_BUMPED distinguishes the two recoveries
-# the trap can give: before version.env is touched, the fix is just
-# "start hindsight back up on $CUR" (nothing else changed); after, it's the
-# full dump-restore rollback below.
+# Arm the trap NOW, BEFORE the pull below — not after it. A pull failure
+# leaves the running stack and version.env untouched, but it must still be
+# verified-and-reported the same way any other failure is (this is exactly
+# what makes "image pull failure -> exit 2" a meaningful, tested contract
+# for bin/check-upstream.sh, instead of a bare untrapped `exit 1`).
+# VERSION_BUMPED distinguishes the two recoveries the trap can give: before
+# version.env is touched (covers a failed pull, a failed stop, or a failed
+# backup), the fix is just "make sure hindsight is still up on $CUR"
+# (nothing else changed, so `hs up -d` is a safe no-op if it was never
+# stopped); after, it's the full dump-restore rollback below. Either way,
+# the outcome is now VERIFIED (version.env + the running container's own
+# image tag + a real /health check), not just assumed from a command's exit
+# status — see verify_on_version.
 FAILED=1
 VERSION_BUMPED=0
 print_rollback() {
@@ -131,29 +146,62 @@ the database, and leaves hindsight stopped either way — it will say clearly
 if the restore itself failed, in which case do not proceed to step 4.
 TXT
 }
+# verify_on_version <expected-version> -- the ONLY source of truth for "is
+# hindsight actually back on <expected-version> and healthy": version.env's
+# pin, the RUNNING container's own image tag (`hs ps` — catches a sed that
+# silently no-opped, or a container docker never actually recreated), and a
+# real /health check. All three must agree; printing "OK" on the strength
+# of a command merely exiting 0 is exactly how this used to lie.
+verify_on_version() {
+  local expected="$1" env_ver image
+  env_ver="$(env_get "$CONFIG_DIR/version.env" HINDSIGHT_VERSION)"
+  if [ "$env_ver" != "$expected" ]; then
+    echo "ERROR: version.env pins '$env_ver', expected '$expected'." >&2
+    return 1
+  fi
+  image="$("$HS" ps --format '{{.Image}}' hindsight 2>/dev/null | tail -n1)"
+  case "$image" in
+    *":$expected") ;;
+    *)
+      echo "ERROR: running hindsight container's image is '${image:-<none>}', expected a tag ending ':$expected'." >&2
+      return 1
+      ;;
+  esac
+  if ! "$HS" ready; then
+    echo "ERROR: hindsight on $expected did not answer /health." >&2
+    return 1
+  fi
+  return 0
+}
 # Runs the exact commands print_rollback above only prints, for --auto-rollback.
-# Returns 0 if hindsight ends up back on $CUR and healthy, 1 if any step of
-# the rollback itself failed (unknown/bad state) — on_exit below turns that
-# into the distinct exit code 2 / 3 documented at the top of this file.
+# Returns 0 ONLY if verify_on_version confirms hindsight ended up back on
+# $CUR and healthy, 1 if any step (including that verification) failed —
+# on_exit below turns that into the distinct exit code 2 / 3 documented at
+# the top of this file. Every step is explicitly checked: this function
+# only ever runs inside an `if`, where set -e is suspended for everything
+# it calls, so an unchecked command failing here would be silently ignored.
 do_auto_rollback() {
   echo "AUTO-ROLLBACK: restoring $CUR from $PRE_DUMP" >&2
   if ! "$HS" stop hindsight; then
     echo "WARNING: 'hs stop hindsight' failed during auto-rollback — continuing anyway." >&2
   fi
-  sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|" "$CONFIG_DIR/version.env"
-  if ! "$CONFIG_DIR/bin/restore-db.sh" --yes --no-start "$PRE_DUMP"; then
-    echo "ERROR: auto-rollback's restore-db.sh failed — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
+  if ! sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|" "$CONFIG_DIR/version.env"; then
+    echo "ERROR: auto-rollback could not revert version.env to $CUR — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
+    return 1
+  fi
+  if ! timeout "$RESTORE_TIMEOUT" "$CONFIG_DIR/bin/restore-db.sh" --yes --no-start "$PRE_DUMP"; then
+    echo "ERROR: auto-rollback's restore-db.sh failed (or exceeded ${RESTORE_TIMEOUT}s) — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
     return 1
   fi
   if ! "$HS" up -d; then
     echo "ERROR: auto-rollback could not start hindsight on $CUR — run manually: $HS up -d" >&2
     return 1
   fi
-  if ! "$HS" ready; then
-    echo "ERROR: hindsight on $CUR did not become ready after auto-rollback — check: $HS logs hindsight" >&2
+  if ! verify_on_version "$CUR"; then
+    echo "ERROR: auto-rollback brought hindsight up but could not VERIFY it is back on $CUR and healthy — manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
     return 1
   fi
-  echo "AUTO-ROLLBACK OK — hindsight is back on $CUR and healthy." >&2
+  echo "AUTO-ROLLBACK OK — hindsight is back on $CUR and healthy (verified version.env + image + /health)." >&2
   return 0
 }
 on_exit() {
@@ -171,17 +219,28 @@ on_exit() {
     exit "$status"
   else
     echo >&2
-    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back." >&2
+    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back (no pre-upgrade dump exists yet either)." >&2
     echo "Restarting hindsight on $CUR..." >&2
-    if "$HS" up -d; then
-      echo "hindsight restarted on $CUR." >&2
+    if "$HS" up -d && verify_on_version "$CUR"; then
+      echo "hindsight restarted on $CUR and VERIFIED healthy (version.env + image + /health)." >&2
+      exit 2
     else
-      echo "ERROR: could not restart hindsight automatically — run manually: $HS up -d" >&2
+      echo "ERROR: could not VERIFY hindsight is back up and healthy on $CUR — run manually: $HS up -d; $HS ready; check: $HS logs hindsight" >&2
+      exit 3
     fi
-    exit "$status"
   fi
 }
 trap on_exit EXIT
+
+say "2/7 Pull target image ($NEW) before changing anything"
+# Via shell env override (Compose gives shell env precedence over
+# --env-file for interpolation), NOT version.env yet: a bad version or
+# network failure here leaves the running stack and version.env untouched,
+# so on_exit's VERSION_BUMPED=0 branch just re-verifies hindsight is still
+# fine on $CUR (a no-op `hs up -d` if it was never stopped) rather than
+# rolling anything back. Bounded by $PULL_TIMEOUT — a cold pull is already
+# the single slowest step in this script and must not hang forever.
+HINDSIGHT_VERSION="$NEW" timeout "$PULL_TIMEOUT" "$HS" pull hindsight
 
 say "3/7 Stopping hindsight (db stays up) so the backup below is final"
 # Taking the backup BEFORE stopping (an earlier version of this script did
@@ -198,7 +257,7 @@ if printf '%s\n' "$running_services" | grep -qx hindsight; then
 fi
 
 say "4/7 Final backup (the only rollback path — migrations are forward-only)"
-backup_out="$("$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"
+backup_out="$(timeout "$BACKUP_TIMEOUT" "$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"
 echo "$backup_out"
 PRE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
 [ -f "$PRE_DUMP" ] || { echo "couldn't determine the pre-upgrade dump path — aborting before touching anything else." >&2; exit 1; }
@@ -206,7 +265,7 @@ echo "pre-upgrade dump (hindsight was already stopped when this was taken): $PRE
 
 if [ -f "$CONFIG_DIR/secrets.env" ]; then
   say "4b/7 R2 6h snapshot of that same state (best-effort)"
-  "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped — the local backup above still covers rollback." >&2
+  timeout "$BACKUP_TIMEOUT" "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped (or exceeded ${BACKUP_TIMEOUT}s) — the local backup above still covers rollback." >&2
 else
   echo
   echo "no secrets.env — skipping R2 snapshot (local backup above still covers rollback)."
