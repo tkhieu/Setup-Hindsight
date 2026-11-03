@@ -5,6 +5,12 @@
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# server-setup/ is always one level under the repo root in this layout
+# (confirmed: docs/, tests/, README.md, .gitignore all live next to
+# server-setup/) — resolved for real here instead of assumed, so the git
+# commands this script prints at the end work regardless of the operator's
+# actual shell cwd (docs/PLAYBOOK.md has them working from ~/hindsight/server-setup).
+REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
 HS="$CONFIG_DIR/bin/hs"
@@ -27,22 +33,7 @@ ask() { read -r -p "$1 [y/N] " a; [ "$a" = y ] || [ "$a" = Y ]; }
 
 [ "$CUR" != "$NEW" ] || { echo "already at $NEW."; exit 0; }
 
-say "1/6 Local backup (the only rollback path — migrations are forward-only)"
-backup_out="$("$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"
-echo "$backup_out"
-PRE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
-[ -f "$PRE_DUMP" ] || { echo "couldn't determine the pre-upgrade dump path — aborting before touching anything." >&2; exit 1; }
-echo "pre-upgrade dump: $PRE_DUMP"
-
-if [ -f "$CONFIG_DIR/secrets.env" ]; then
-  say "1b/6 R2 6h snapshot (best-effort — upgrade continues even if this fails)"
-  "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped — the local backup above still covers rollback." >&2
-else
-  echo
-  echo "no secrets.env — skipping R2 snapshot (local backup above still covers rollback)."
-fi
-
-say "2/6 Changes $CUR -> $NEW"
+say "1/7 Changes $CUR -> $NEW"
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
   gh api "repos/vectorize-io/hindsight/compare/v$CUR...v$NEW" \
     --jq '.commits[] | .sha[0:7] + "  " + (.commit.message | split("\n")[0])' 2>/dev/null \
@@ -54,12 +45,44 @@ fi
 echo
 ask "Diff above OK — continue upgrading $CUR -> $NEW?" || { echo "aborted (nothing changed yet)."; exit 1; }
 
-say "3/6 Pull target image ($NEW) before changing anything"
+say "2/7 Pull target image ($NEW) before changing anything"
 # Via shell env override (Compose gives shell env precedence over
 # --env-file for interpolation), NOT version.env yet: a bad version or
 # network failure here leaves the running stack and version.env untouched,
 # so there is nothing to roll back and no trap is needed above this line.
 HINDSIGHT_VERSION="$NEW" "$HS" pull hindsight
+
+say "3/7 Stopping hindsight (db stays up) so the backup below is final"
+# Taking the backup BEFORE stopping (the previous ordering) leaves a window
+# where writes after the dump but before the stack actually stops are lost
+# if that dump is ever used for a rollback. Stopping first means the dump
+# taken in the next step is provably the exact state the old version left
+# behind — nothing written after it, nothing missing from it.
+"$HS" stop hindsight
+running_services="$("$HS" ps --services --status running)"
+if printf '%s\n' "$running_services" | grep -qx hindsight; then
+  echo "ERROR: hindsight is still running after 'hs stop hindsight' — aborting before touching anything else." >&2
+  exit 1
+fi
+
+say "4/7 Final backup (the only rollback path — migrations are forward-only)"
+if ! backup_out="$("$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"; then
+  echo "ERROR: backup failed — hindsight is stopped, but version.env/image are unchanged." >&2
+  echo "Nothing to roll back; just restart when ready: $HS start hindsight" >&2
+  exit 1
+fi
+echo "$backup_out"
+PRE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
+[ -f "$PRE_DUMP" ] || { echo "couldn't determine the pre-upgrade dump path — aborting before touching anything else." >&2; exit 1; }
+echo "pre-upgrade dump (hindsight was already stopped when this was taken): $PRE_DUMP"
+
+if [ -f "$CONFIG_DIR/secrets.env" ]; then
+  say "4b/7 R2 6h snapshot of that same state (best-effort)"
+  "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped — the local backup above still covers rollback." >&2
+else
+  echo
+  echo "no secrets.env — skipping R2 snapshot (local backup above still covers rollback)."
+fi
 
 # From here on, state changes on disk/in the stack — arm the rollback
 # printer so ANY failure (this script exiting for any reason before the
@@ -79,22 +102,24 @@ would be exactly backwards):
   4. $CONFIG_DIR/bin/hs up -d
   5. $CONFIG_DIR/bin/hs ready
 
-Step 3 fetches nothing (it's already a local path), verifies the dump,
-takes its own extra pre-restore backup, recreates the database, and leaves
-hindsight stopped either way — it will say clearly if the restore itself
-failed, in which case do not proceed to step 4.
+$PRE_DUMP is the exact state right before this upgrade's version switch —
+hindsight was already stopped when it was taken, so nothing written after
+it is lost by restoring it. Step 3 fetches nothing (it's already a local
+path), verifies the dump, takes its own extra pre-restore backup, recreates
+the database, and leaves hindsight stopped either way — it will say clearly
+if the restore itself failed, in which case do not proceed to step 4.
 TXT
 }
 trap '[ "$FAILED" = 1 ] && print_rollback' EXIT
 
-say "4/6 Bump version.env"
+say "5/7 Bump version.env"
 sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$NEW|" "$CONFIG_DIR/version.env"
 grep -E '^HINDSIGHT_VERSION=' "$CONFIG_DIR/version.env"
 
-say "5/6 Up"
+say "6/7 Up"
 "$HS" up -d
 
-say "6/6 Waiting for ready (up to 5 min)"
+say "7/7 Waiting for ready (up to 5 min)"
 if ! HINDSIGHT_READY_TIMEOUT=300 "$HS" ready; then
   echo "NOT ready after 5 minutes. Check: hs logs hindsight" >&2
   exit 1
@@ -106,8 +131,11 @@ cat <<TXT
 Upgraded $CUR -> $NEW.
 
 Two things left:
-  1. Commit + push version.env:
-       git add server-setup/version.env && git commit -m "chore: bump hindsight to $NEW" && git push
+  1. Commit + push version.env (from any cwd — these use the resolved repo
+     root, $REPO_ROOT, not a path relative to where you happen to be):
+       git -C "$REPO_ROOT" add server-setup/version.env
+       git -C "$REPO_ROOT" commit -m "chore: bump hindsight to $NEW"
+       git -C "$REPO_ROOT" push
   2. Smoke test: bin/smoke.sh
 
 Pre-upgrade dump kept at: $PRE_DUMP

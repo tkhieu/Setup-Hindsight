@@ -243,17 +243,26 @@ gì tới DB thật):
 1. Tải bản dump (hoặc copy file local) vào file tạm.
 2. Verify: không rỗng, `gunzip -t` qua được.
 3. Hỏi xác nhận (bỏ qua bằng `--yes`).
-4. **Backup pre-restore local** — bắt buộc phải thành công, nếu không script
+4. **`bin/hs up -d db`** — đảm bảo riêng `db` đang chạy (KHÔNG động vào
+   `hindsight`). Đây là restore "lạnh" thật sự: server mới, chưa chạy gì,
+   hoặc đang hồi phục sau sự cố mà không có gì đang chạy — không có bước
+   này, bước 5 dưới sẽ fail vì không `exec` được vào một container chưa
+   tồn tại. Vô hại nếu `db` đã chạy sẵn.
+5. **Backup pre-restore local** — bắt buộc phải thành công, nếu không script
    dừng tại đây, chưa đụng gì tới DB thật.
-5. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh stop).
-6. `DROP DATABASE ... WITH (FORCE); CREATE DATABASE ...`
-7. Restore (`psql -1 -f -` — một transaction, lỗi giữa đường thì rollback
+6. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh stop).
+7. `DROP DATABASE ... WITH (FORCE); CREATE DATABASE ...`
+8. Restore (`psql -1 -f -` — một transaction, lỗi giữa đường thì rollback
    toàn bộ, không để DB ở trạng thái nửa vời).
-8. `bin/hs start hindsight` + `bin/hs ready` (bỏ qua bằng `--no-start`, dùng
-   trong rollback của `upgrade.sh` — image cũ tự start ở bước sau).
+9. `bin/hs up -d hindsight` + `bin/hs ready` — dùng `up -d`, không phải
+   `start`, vì `start` chỉ khởi động được container ĐÃ TỒN TẠI; sau `hs down`
+   hoặc trên server chưa từng chạy, container đó chưa được tạo, `start` sẽ
+   im lặng không làm gì và `hs ready` sẽ timeout vào chỗ không có gì đang
+   chạy. Bỏ qua bước này bằng `--no-start`, dùng trong rollback của
+   `upgrade.sh` — image cũ tự lên lại ở bước sau.
 
-Nếu bước 7 fail: hindsight **không** được start lại, script in sẵn lệnh
-restore lại từ bản pre-restore vừa tạo ở bước 4.
+Nếu bước 8 fail: hindsight **không** được start lại, script in sẵn lệnh
+restore lại từ bản pre-restore vừa tạo ở bước 5.
 
 ---
 
@@ -267,10 +276,25 @@ bin/restore-db.sh --drill r2:latest
 
 Restore vào DB tạm `restoretest_<timestamp>_<pid>` (tên duy nhất mỗi lần
 chạy — không thể trùng và xoá nhầm DB có sẵn), kiểm tra 4 bảng cốt lõi
-(`banks`, `memory_units`, `entities`, `documents`) tồn tại và có số dòng
-hợp lý (mặc định ≥ 1 — đổi bằng `HINDSIGHT_DRILL_MIN_ROWS=0` nếu server mới
-cài chưa từng retain gì), rồi **luôn xoá** `restoretest_*` dù thành công hay
-thất bại. **Không bao giờ đụng tới DB thật hoặc dừng `hindsight`.**
+(`banks`, `memory_units`, `entities`, `documents`) **tồn tại** (bắt buộc,
+không điều kiện — bắt lỗi schema/dump hỏng), rồi áp số dòng tối thiểu có
+chọn lọc theo schema thật của v1.1.0:
+
+- `banks` phải ≥ `HINDSIGHT_DRILL_MIN_ROWS` (mặc định 1) — đây là phép kiểm
+  "có phải backup của instance đã dùng thật không"; set `=0` nếu server mới
+  cài chưa từng tạo bank nào.
+- `memory_units` chỉ bắt buộc > 0 **khi `banks` > 0** — một bank có thể tồn
+  tại hợp lệ mà chưa retain gì (`PUT /v1/default/banks/{id}` tạo bank ngay,
+  memory bằng 0), nhưng có bank mà toàn bộ phần nội dung trống rỗng mới là
+  dấu hiệu dump bị cắt/hỏng.
+- `entities`, `documents` **không** bắt số dòng tối thiểu — entity là sản
+  phẩm của một bước trích xuất riêng trên nội dung đã retain
+  (`models.py: Entity.bank_id`, bảng nối `unit_entities`), nội dung không
+  sinh ra entity nào là bình thường; `memory_units.document_id` cũng không
+  có ràng buộc NOT NULL buộc mọi memory phải thuộc một document.
+
+Sau đó **luôn xoá** `restoretest_*` dù thành công hay thất bại. **Không bao
+giờ đụng tới DB thật hoặc dừng `hindsight`.**
 
 ```bash
 bin/restore-db.sh --drill --drill-full r2:latest
@@ -320,14 +344,21 @@ systemctl --user start hindsight-restore-drill   # chạy ngay, không đợi l�
 bin/upgrade.sh 1.2.0
 ```
 
-Thứ tự: backup local (bắt buộc) → best-effort snapshot R2 `6h` → in diff
-commit giữa hai tag trên GitHub (`gh api ... compare`, bỏ qua nếu không có
-`gh`) → hỏi xác nhận → pull image đích (CHƯA đổi gì trên đĩa — pull lỗi thì
-không có gì phải rollback) → bump `version.env` → `up -d` → chờ `/health`
-tối đa 5 phút.
+Thứ tự: in diff commit giữa hai tag trên GitHub (`gh api ... compare`, bỏ
+qua nếu không có `gh`) → hỏi xác nhận → **pull image đích** (CHƯA đổi gì
+trên đĩa — pull lỗi thì không có gì phải rollback) → **dừng `hindsight`**
+(giữ `db` sống) → **backup local** (bắt buộc — đây là bản dump duy nhất
+dùng để rollback) → best-effort snapshot R2 `6h` của đúng bản đó → bump
+`version.env` → `up -d` → chờ `/health` tối đa 5 phút.
 
-Từ bước pull image trở đi, bất kỳ lỗi nào (script exit vì bất cứ lý do gì)
-đều in sẵn lệnh rollback đúng thứ tự:
+**Vì sao dừng app TRƯỚC khi backup, không phải sau:** backup lấy *trước*
+khi dừng app để lại một khoảng hở — mọi ghi dữ liệu xảy ra giữa lúc backup
+xong và lúc app thực sự dừng sẽ mất nếu sau này phải rollback về bản đó.
+Dừng app rồi mới backup đảm bảo bản dump là đúng-y trạng thái cuối cùng của
+version cũ, không thiếu không dư.
+
+Từ lúc app bị dừng trở đi, bất kỳ lỗi nào (script exit vì bất cứ lý do gì)
+đều in sẵn lệnh rollback đúng thứ tự, nêu rõ tên file dump vừa tạo:
 
 ```bash
 bin/hs stop hindsight
@@ -342,10 +373,13 @@ khởi động (`HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP`, mặc định bật, 
 tự nhận là idempotent) — migration là **forward-only**. Khởi động lại image
 cũ trên một DB mà image mới đã migrate là đi ngược, không phải là rollback.
 `restore-db.sh` ở bước 3 phục hồi đúng bản dump lấy từ *trước* khi migration
-mới chạy.
+mới chạy — và vì app đã dừng khi lấy bản đó (xem trên), phục hồi nó không
+làm mất ghi dữ liệu nào.
 
 Sau khi upgrade xong (dù rollback hay thành công): commit + push
-`version.env`, rồi chạy `bin/smoke.sh`.
+`version.env` — script tự in sẵn lệnh đúng, dùng `git -C <repo-root>` nên
+chạy được dù bạn đang ở cwd nào, không chỉ từ `~/hindsight/server-setup` —
+rồi chạy `bin/smoke.sh`.
 
 ---
 
@@ -364,6 +398,7 @@ Sau khi upgrade xong (dù rollback hay thành công): commit + push
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |
 | Diễn tập restore fail "table missing/empty" | xem §7 "Đọc kết quả thế nào" | |
+| Muốn xem compose đã resolve image/port/volume đúng chưa | `hs config` (không flag) in MỌI secret đã resolve ra stdout | chỉ dùng `hs config --services` hoặc `hs config --quiet` (validate, không in secret); hai flag này cố ý là lựa chọn DUY NHẤT được cho phép |
 
 **Đọc log đúng chỗ:**
 ```bash
@@ -384,6 +419,14 @@ journalctl --user -u 'hindsight-backup@*' -n 50 --no-pager
 - `~/.cloudflared/hindsight-config.yml` **đã điền UUID thật** — bản trong
   git (`server-setup/cloudflared/config.yml`) chỉ là template với
   placeholder, không bao giờ sửa nó để chứa UUID/credentials thật rồi commit.
+
+**Secret không bao giờ nằm trong argv của process** (đọc được bởi bất kỳ
+user nào trên máy qua `ps`/`/proc/<pid>/cmdline`, không chỉ qua `git`):
+`smoke.sh`/`restore-db.sh --drill-full` gửi API key cho `curl` qua `-K -`
+(đọc config từ stdin) chứ không phải `-H`; mật khẩu Postgres cho
+`docker compose run` qua `-e TEN_BIEN` (chỉ tên, giá trị lấy từ environment
+của process, không phải `-e TEN_BIEN=giá_trị`). Nếu bạn thêm lệnh mới gọi
+`curl`/`docker`/`psql`/`rclone` với một secret, giữ đúng hai khuôn này.
 
 Repo là private (`github.com/tkhieu/Setup-Hindsight`), nhưng vẫn áp dụng
 quy tắc như mọi repo secret khác: review `git status`/`git diff` trước khi

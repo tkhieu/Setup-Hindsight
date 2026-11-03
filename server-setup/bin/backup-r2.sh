@@ -56,10 +56,15 @@ promote() {  # promote <dest-prefix>
 
 case "$MODE" in
   6h)
-    # Dump to a STAGING key outside db/ first. If pg_dump dies mid-stream,
-    # `set -o pipefail` (from set -euo pipefail above) fails the whole
-    # pipeline and the script exits before the promote step, so a truncated
-    # object can land in staging but db/6h/ never sees it.
+    # Dump to a STAGING key outside db/ first, and never promote anything
+    # from staging to db/6h/ (the "final" prefix.sql.gz below) without an
+    # explicit, checked success of the whole pg_dump|gzip|rcat pipeline —
+    # relying on `set -o pipefail` to abort the script via `set -e` alone
+    # would still leave a half-uploaded object sitting in staging/ (not
+    # harmful on its own: r2:latest resolution only ever reads db/<tier>/,
+    # never staging/, and the lifecycle rule expires it in a day — but
+    # "never upload/promote a failed dump" should hold without relying on
+    # that lifecycle rule as the actual safety net).
     #
     # Promotion is `rclone copyto` (copy, not move): this script never
     # deletes anything, including its own staging objects — that would break
@@ -69,9 +74,12 @@ case "$MODE" in
     staging="staging/db/$STAMP.sql.gz"
     final="db/6h/$STAMP.sql.gz"
     log "dump -> $staging (staging)"
-    "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
-      | gzip \
-      | "$RCLONE" rcat "$DEST/$staging"
+    if ! "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
+        | gzip \
+        | "$RCLONE" rcat "$DEST/$staging"; then
+      echo "ERROR: pg_dump|gzip|rcat failed — nothing promoted to $final" >&2
+      exit 1
+    fi
 
     # Verify by reading the size back from R2 — catches an empty dump that
     # would otherwise exit 0.

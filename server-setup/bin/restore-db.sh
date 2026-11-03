@@ -153,25 +153,55 @@ if [ "$DRILL" = 1 ]; then
   fi
 
   say "Checking core tables"
-  # Confirmed table names: hindsight_api/models.py __tablename__ =
-  # banks/memory_units/entities/documents. A restored dump from a
-  # previously-used instance must have rows in all four, or the drill has
-  # found a real problem (corrupt dump, wrong schema, or an instance nobody
-  # has ever retained anything into yet — override with
-  # HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install).
+  # Confirmed table names and schema: hindsight_api/models.py
+  # __tablename__ = banks/memory_units/entities/documents.
+  #
+  # Existence is checked unconditionally for all four — that catches a
+  # corrupt dump or a schema mismatch regardless of how much data is in it.
+  #
+  # Non-zero is asserted more narrowly, justified from the v1.1.0 schema:
+  #   - banks: a dump worth protecting with backups should have at least
+  #     one, so this is the real "does this look like a used instance"
+  #     check (override with HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely
+  #     fresh install that has never had a bank created).
+  #   - memory_units: only required non-zero when banks has data — a bank
+  #     can legitimately exist with nothing retained into it yet
+  #     (PUT /v1/default/banks/{id} creates one with zero memories), so
+  #     banks>0 with memory_units=0 is only suspicious, not definitionally
+  #     broken, but banks>0 while the dump otherwise looks totally empty of
+  #     content is exactly the "truncated dump" shape this check exists for.
+  #   - entities: Entity rows come from a separate extraction step over
+  #     memory_units' content (models.py: Entity.bank_id, UnitEntity join
+  #     table) — content that yields no identifiable named entities is
+  #     normal, so zero entities does not mean the dump is broken.
+  #   - documents: MemoryUnit.document_id is nullable with no NOT NULL
+  #     constraint tying every memory unit to a document row, so this
+  #     table being empty does not by itself prove anything is missing
+  #     either.
   MIN_ROWS="${HINDSIGHT_DRILL_MIN_ROWS:-1}"
+  banks_count=0
+  memory_units_count=0
   for table in banks memory_units entities documents; do
     count="$("$HS" exec -T db psql -U "$DB_USER" -d "$DRILL_DB" -tAc "SELECT count(*) FROM $table;" 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$count" ]; then
       echo "ERROR: table '$table' missing or unreadable in the restored dump" >&2
       exit 1
     fi
-    if [ "$count" -lt "$MIN_ROWS" ]; then
-      echo "ERROR: table '$table' has $count row(s) (< $MIN_ROWS) — restored dump looks empty/unsane" >&2
-      exit 1
-    fi
     echo "    $table: $count rows"
+    case "$table" in
+      banks) banks_count="$count" ;;
+      memory_units) memory_units_count="$count" ;;
+    esac
   done
+
+  if [ "$banks_count" -lt "$MIN_ROWS" ]; then
+    echo "ERROR: 'banks' has $banks_count row(s) (< $MIN_ROWS) — restored dump looks like an unused instance (override with HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install)" >&2
+    exit 1
+  fi
+  if [ "$banks_count" -gt 0 ] && [ "$memory_units_count" -eq 0 ]; then
+    echo "ERROR: 'banks' has $banks_count bank(s) but 'memory_units' has 0 rows — looks like a truncated/incomplete dump" >&2
+    exit 1
+  fi
 
   if [ "$DRILL_FULL" = 1 ]; then
     say "Drill-full: booting a temporary hindsight against $DRILL_DB"
@@ -179,8 +209,18 @@ if [ "$DRILL" = 1 ]; then
     api_key="${HINDSIGHT_API_TENANT_API_KEY:-}"
     [ -n "$api_key" ] || { echo "ERROR: HINDSIGHT_API_TENANT_API_KEY not set — needed to query bank counts" >&2; exit 1; }
 
+    # Header goes to curl via a `-K -` config file read from stdin, never
+    # as a `-H` argv token — argv is visible to every local user via
+    # `ps`/`/proc/<pid>/cmdline`, stdin is not. Backslash/quote are escaped
+    # because curl's config-file parser treats a bare `"`/`\` in the value
+    # as syntax (would both break parsing and — if a specially-crafted key
+    # ever managed to inject a second `header =` line — forge an extra
+    # header), not because an API key is expected to contain them.
     bank_total() {  # bank_total <base-url>
-      curl -fsS --max-time 5 -H "Authorization: Bearer $api_key" "$1/v1/default/banks?limit=1" \
+      local esc_key
+      esc_key=$(printf '%s' "$api_key" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf 'header = "Authorization: Bearer %s"\n' "$esc_key" \
+        | curl -fsS --max-time 5 -K - "$1/v1/default/banks?limit=1" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["total"])'
     }
 
@@ -188,11 +228,17 @@ if [ "$DRILL" = 1 ]; then
     live_total="$(bank_total "$live_url")" || { echo "ERROR: could not read bank count from the live instance ($live_url)" >&2; exit 1; }
     echo "    live bank count ($live_url): $live_total"
 
+    # The drill DB's connection string (carries HINDSIGHT_DB_PASSWORD) is
+    # exported as a real shell/process env var and referenced in `-e` by
+    # NAME ONLY — `docker compose run -e NAME=value` would otherwise put
+    # the password straight into this process's argv (visible via `ps`).
+    export HINDSIGHT_API_DATABASE_URL="postgresql://${DB_USER}:${HINDSIGHT_DB_PASSWORD}@db:5432/${DRILL_DB}"
     DRILL_CID="$(docker compose -f "$CONFIG_DIR/compose.yaml" \
       --env-file "$CONFIG_DIR/version.env" --env-file "$CONFIG_DIR/base.env" --env-file "$CONFIG_DIR/secrets.env" \
       run --rm -d --no-deps -p "127.0.0.1:${PORT}:8888" \
-      -e HINDSIGHT_API_DATABASE_URL="postgresql://${DB_USER}:${HINDSIGHT_DB_PASSWORD}@db:5432/${DRILL_DB}" \
+      -e HINDSIGHT_API_DATABASE_URL \
       hindsight)"
+    unset HINDSIGHT_API_DATABASE_URL
 
     drill_url="http://127.0.0.1:${PORT}"
     echo "    waiting for $drill_url/health"
@@ -224,13 +270,28 @@ if [ "$YES" != 1 ]; then
   ask "Continue?" || { echo "aborted (nothing changed)."; exit 1; }
 fi
 
-# ---- 4. local backup first — must succeed, or the whole script aborts here -
+# ---- 4. ensure db is up (NOT the app) — bin/backup.sh needs a running db --
+# A truly cold restore (fresh server, nothing ever started, or recovering
+# after a crash with nothing up) would otherwise fail right here: `hs exec`
+# into a stopped/nonexistent db container errors out before any backup is
+# even attempted. `up -d db` is idempotent either way — a no-op if db is
+# already running.
+say "Ensuring db is up (hindsight itself is untouched for now)"
+"$HS" up -d db
+for _ in $(seq 1 30); do
+  "$HS" exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1 && break
+  sleep 1
+done
+"$HS" exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1 \
+  || { echo "ERROR: db did not become ready" >&2; exit 1; }
+
+# ---- 5. local backup first — must succeed, or the whole script aborts here -
 say "Local backup (pre-restore) — required before touching anything"
 backup_out="$("$CONFIG_DIR/bin/backup.sh" pre-restore)"
 echo "$backup_out"
 PRE_RESTORE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
 
-# ---- 5. stop hindsight and verify it's actually stopped --------------------
+# ---- 6. stop hindsight and verify it's actually stopped --------------------
 say "Stopping hindsight"
 "$HS" stop hindsight
 running_services="$("$HS" ps --services --status running)"
@@ -239,13 +300,13 @@ if printf '%s\n' "$running_services" | grep -qx hindsight; then
   exit 1
 fi
 
-# ---- 6. recreate the database -----------------------------------------------
+# ---- 7. recreate the database -----------------------------------------------
 say "Recreating database $DB_NAME"
 "$HS" exec -T db psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d postgres \
   -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" \
   -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
 
-# ---- 7. restore --------------------------------------------------------------
+# ---- 8. restore --------------------------------------------------------------
 # -1/--single-transaction only takes effect alongside -f (or -c) — hence
 # `-f -` to read the script from stdin instead of relying on plain
 # redirection, so a failure partway through rolls the whole restore back.
@@ -256,7 +317,14 @@ if gunzip -c "$TMP" | "$HS" exec -T db psql -v ON_ERROR_STOP=1 -1 -f - -U "$DB_U
     echo "Restore OK. --no-start given: leaving hindsight stopped."
   else
     say "Starting hindsight"
-    "$HS" start hindsight
+    # `up -d` (create-if-missing + start), not `start` (which can only start
+    # a container that already exists) — a truly cold restore (step 4
+    # above) can run against a stack where hindsight's container was never
+    # created at all, e.g. after `hs down` or on a fresh server; `start`
+    # would silently do nothing in that case and `hs ready` would then
+    # time out against nothing listening. `up -d` is a no-op either way
+    # when the container already exists and is already running.
+    "$HS" up -d hindsight
     "$HS" ready
   fi
 else

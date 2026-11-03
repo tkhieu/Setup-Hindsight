@@ -32,16 +32,32 @@ DB_NAME="${HINDSIGHT_DB_NAME:-hindsight_db}"
 
 mkdir -p "$BACKUP_DIR"
 
-echo "==> pg_dump -> ${PREFIX}-db.sql.gz"
-# pipefail makes a failing pg_dump abort instead of being swallowed by gzip.
-"$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "${PREFIX}-db.sql.gz"
+# Write to a .partial name first and only `mv` it into place once pg_dump
+# exited 0, gzip -t confirms it isn't corrupt, AND it clears the size
+# floor. Without this, `set -e` aborts the script the instant the bare
+# pipeline below reports a failure — gzip may already have flushed some
+# bytes to the destination by then, and that half-written file would be
+# left behind under its FINAL name (never reaching the size check that was
+# supposed to catch and remove it), where `keeping last $KEEP` could count
+# it as a real backup. The trap below cleans up the partial on ANY exit,
+# including that `set -e` abort.
+PARTIAL="${PREFIX}-db.sql.gz.partial"
+trap 'rm -f "$PARTIAL"' EXIT
 
-size=$(stat -c%s "${PREFIX}-db.sql.gz")
-if [ "$size" -lt "$MIN_BYTES" ]; then
-  echo "ERROR: dump is only $size bytes (< $MIN_BYTES). Treating as failed." >&2
-  rm -f "${PREFIX}-db.sql.gz"
+echo "==> pg_dump -> ${PREFIX}-db.sql.gz"
+if ! "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$PARTIAL"; then
+  echo "ERROR: pg_dump failed — no file left under the final name." >&2
   exit 1
 fi
+
+gzip -t "$PARTIAL" || { echo "ERROR: dump is corrupt (gzip -t failed)." >&2; exit 1; }
+
+size=$(stat -c%s "$PARTIAL")
+if [ "$size" -lt "$MIN_BYTES" ]; then
+  echo "ERROR: dump is only $size bytes (< $MIN_BYTES). Treating as failed." >&2
+  exit 1
+fi
+mv -f "$PARTIAL" "${PREFIX}-db.sql.gz"
 echo "    ok, $size bytes"
 
 echo "==> keeping last $KEEP"

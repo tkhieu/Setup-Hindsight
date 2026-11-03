@@ -21,17 +21,24 @@ set +a
 
 BASE_URL="$("$HS" url)"
 BANK_ID="smoke-$(date +%s)-$$"
-AUTH=(-H "Authorization: Bearer $HINDSIGHT_API_TENANT_API_KEY")
+# Escaped once up front, not per-call: curl's config-file parser treats a
+# bare `"`/`\` in the value as syntax.
+AUTH_HEADER_ESCAPED=$(printf '%s' "$HINDSIGHT_API_TENANT_API_KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
 say() { printf '\n==> %s\n' "$*"; }
 
 req() {  # req <method> <path> [json-body]
   local method="$1" path="$2" body="${3:-}" out status
+  # Authorization goes to curl via a `-K -` config file read from stdin,
+  # never as a `-H` argv token — argv is visible to every local user via
+  # `ps`/`/proc/<pid>/cmdline`, stdin is not.
   if [ -n "$body" ]; then
-    out="$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$method" "${AUTH[@]}" \
-      -H 'Content-Type: application/json' -d "$body" "$BASE_URL$path")"
+    out="$(printf 'header = "Authorization: Bearer %s"\n' "$AUTH_HEADER_ESCAPED" \
+      | curl -sS --max-time 30 -w '\n%{http_code}' -K - -X "$method" \
+        -H 'Content-Type: application/json' -d "$body" "$BASE_URL$path")"
   else
-    out="$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$method" "${AUTH[@]}" "$BASE_URL$path")"
+    out="$(printf 'header = "Authorization: Bearer %s"\n' "$AUTH_HEADER_ESCAPED" \
+      | curl -sS --max-time 30 -w '\n%{http_code}' -K - -X "$method" "$BASE_URL$path")"
   fi
   status="${out##*$'\n'}"
   body_out="${out%$'\n'*}"

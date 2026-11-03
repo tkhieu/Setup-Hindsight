@@ -88,6 +88,28 @@ case "${1:-}" in
   url)
     backend_url
     ;;
+  config)
+    # `docker compose config` with no restricting flag prints every secret
+    # fully resolved (POSTGRES_PASSWORD, API keys, ...) to stdout — exactly
+    # the kind of thing that ends up pasted into a chat/ticket or captured
+    # by a CI log. Only allow the forms that validate without printing
+    # resolved values.
+    shift
+    if [ $# -eq 0 ]; then
+      echo "hs: 'config' with no flags prints every resolved secret — use 'hs config --services' or 'hs config --quiet' (validates without printing)." >&2
+      exit 1
+    fi
+    for arg in "$@"; do
+      case "$arg" in
+        --services | --quiet) ;;
+        *)
+          echo "hs: 'config' only allows --services/--quiet — anything else resolves secrets into the output." >&2
+          exit 1
+          ;;
+      esac
+    done
+    compose config "$@"
+    ;;
   up|start|run|create)
     check_secrets
     compose "$@"
