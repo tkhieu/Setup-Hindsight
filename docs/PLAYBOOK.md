@@ -272,6 +272,8 @@ bin/hs ready
 # Đo thời gian vài lệnh recall đại diện; kiểm tra kết quả và log timeout.
 ```
 
+`bin/reembed.sh` chờ app sẵn sàng tối đa 300 giây; đặt `HINDSIGHT_REEMBED_READY_TIMEOUT` để đổi thời hạn này (không đổi mặc định của `bin/hs ready`).
+
 Không chạy `bin/hs up -d` toàn stack trước `reembed.sh`: DB cũ có vector 384
 chiều và Hindsight sẽ từ chối model 1536 chiều. Script giữ DB cũ tên
 `hindsight_db_pre_embeddings_<giờ>` và in đường dẫn dump. Chạy lại script sau

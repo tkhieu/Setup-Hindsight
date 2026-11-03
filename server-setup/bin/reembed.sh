@@ -9,6 +9,7 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/lock.sh"
 HS="$CONFIG_DIR/bin/hs"
+REEMBED_READY_TIMEOUT="${HINDSIGHT_REEMBED_READY_TIMEOUT:-300}"
 YES=0
 case "${1:-}" in
   '') ;;
@@ -85,7 +86,9 @@ cleanup() {
     "$HS" exec -T db psql -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 \
       -c "ALTER DATABASE \"$OLD_DB\" RENAME TO \"$DB_NAME\"" || true
   fi
-  if [ "$code" -ne 0 ]; then
+  if [ "$code" -ne 0 ] && [ "$verified" = 1 ]; then
+    rm -rf "$WORK"
+  elif [ "$code" -ne 0 ]; then
     echo "reembed: archives retained at $WORK; dump at $backup_path. Keep hindsight stopped until checked." >&2
   fi
   exit "$code"
@@ -116,7 +119,7 @@ renamed=1
 "$HS" exec -T db createdb -U "$DB_USER" -O "$DB_USER" "$DB_NAME"
 if [ "${#banks[@]}" -eq 0 ]; then
   "$HS" up -d
-  "$HS" ready
+  HINDSIGHT_READY_TIMEOUT="$REEMBED_READY_TIMEOUT" "$HS" ready
   bank_count="$("$HS" exec -T db psql -U "$DB_USER" -d "$DB_NAME" -At -c 'SELECT count(*) FROM public.banks')"
   [ "$bank_count" = 0 ] || { echo "reembed: expected an empty bank list" >&2; exit 1; }
   verified=1
@@ -145,6 +148,9 @@ bad_vectors="$("$HS" exec -T db psql -U "$DB_USER" -d "$DB_NAME" -At -c \
 [ "$bad_vectors" = 0 ] || { echo "reembed: $bad_vectors missing/wrong-dimension embeddings" >&2; exit 1; }
 verified=1
 "$HS" up -d
-"$HS" ready
+HINDSIGHT_READY_TIMEOUT="$REEMBED_READY_TIMEOUT" "$HS" ready || {
+  echo "reembed: data migrated and verified; app not ready within ${REEMBED_READY_TIMEOUT}s — check bin/hs logs hindsight, then bin/hs ready" >&2
+  exit 1
+}
 rm -rf "$WORK"
 echo "reembed: verified ${#banks[@]} bank(s), 1536-dimensional embeddings. Old DB: $OLD_DB; dump: $backup_path"
