@@ -81,6 +81,7 @@ T2="$(mktemp -d)"
 mkdir -p "$T2/bin/lib" "$T2/fakebin"
 cp "$SS/bin/restore-db.sh" "$T2/bin/restore-db.sh"
 cp "$SS/bin/lib/env.sh" "$T2/bin/lib/env.sh"
+cp "$SS/bin/lib/dump.sh" "$T2/bin/lib/dump.sh"
 chmod +x "$T2/bin/restore-db.sh"
 
 HS_LOG_2="$T2/hs.log"
@@ -145,7 +146,20 @@ HINDSIGHT_DB_PASSWORD=$DB_CANARY
 HINDSIGHT_API_TENANT_API_KEY=$API_CANARY
 EOF
 
-printf -- '-- dummy sql dump\n' | gzip > "$T2/fixture-dump.sql.gz"
+# A dump shaped enough to pass bin/lib/dump.sh's structural check.
+cat > "$T2/fixture-dump.sql" <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+
+--
+-- PostgreSQL database dump complete
+--
+SQL
+gzip -c "$T2/fixture-dump.sql" > "$T2/fixture-dump.sql.gz"
 
 ( cd "$T2" && PATH="$T2/fakebin:$PATH" HINDSIGHT_DRILL_PORT=18888 \
     ./bin/restore-db.sh --drill --drill-full "$T2/fixture-dump.sql.gz" </dev/null )

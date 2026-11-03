@@ -12,6 +12,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/restore-db.sh" "$TMP/bin/restore-db.sh"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
+cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
 chmod +x "$TMP/bin/restore-db.sh"
 
 LIVE_DB=hindsight_db
@@ -64,7 +65,21 @@ HINDSIGHT_DB_NAME=$LIVE_DB
 EOF
 : > "$TMP/secrets.env"
 
-printf -- '-- dummy sql dump\n' | gzip > "$TMP/fixture-dump.sql.gz"
+# A dump shaped enough to pass bin/lib/dump.sh's structural check (which
+# has its own dedicated test, test_dump_validator.sh).
+cat > "$TMP/fixture-dump.sql" <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+
+--
+-- PostgreSQL database dump complete
+--
+SQL
+gzip -c "$TMP/fixture-dump.sql" > "$TMP/fixture-dump.sql.gz"
 
 cd "$TMP"
 if out="$(./bin/restore-db.sh --drill "$TMP/fixture-dump.sql.gz" </dev/null 2>&1)"; then

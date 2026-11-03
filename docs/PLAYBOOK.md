@@ -341,8 +341,17 @@ sống. Container tạm luôn bị xoá ở cuối (`docker rm -f`), dù kết q
 
 Timer `hindsight-restore-drill.timer` chạy `--drill r2:latest` (không có
 `--drill-full`, vì nó cần mở thêm port và tốn thêm vài chục giây — không
-cần chạy tự động hằng tháng) vào **03:30 ICT ngày 15 hằng tháng**
-(`*-*-14 20:30:00` UTC, `RandomizedDelaySec=900`).
+cần chạy tự động hằng tháng), `OnCalendar=*-*-14 20:30:00` (`RandomizedDelaySec=900`).
+**Đây là giờ LOCAL của server, cùng cảnh báo TZ ở §5** — kiểm tra
+`timedatectl` trước khi tin giờ thật:
+
+| Nếu server = UTC | Nếu server = Asia/Saigon |
+|---|---|
+| 20:30 ngày 14 UTC = **03:30 ICT ngày 15** | **20:30 ICT ngày 14** trực tiếp |
+
+Muốn cố định một giờ ICT cụ thể bất kể server set TZ gì: sửa `OnCalendar=`
+trong `systemd/hindsight-restore-drill.timer` rồi chạy lại
+`bin/install-systemd.sh`, theo cách tính ở §5.
 
 ```bash
 systemctl --user list-timers hindsight-restore-drill.timer
@@ -438,7 +447,7 @@ rồi chạy `bin/smoke.sh`.
 | Retain/recall trả lỗi LLM | `HINDSIGHT_API_LLM_API_KEY` sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
 | UI load được nhưng gọi API lỗi 401 | `HINDSIGHT_CP_DATAPLANE_API_KEY` lệch `HINDSIGHT_API_TENANT_API_KEY` | hai biến này PHẢI giống nhau trong `compose.yaml` (đã set cứng — nếu bạn tự sửa compose, đừng tách ra) |
 | Container tạo lại xong, retain đầu tiên chậm hẳn | volume `hf_cache` bị xoá/mount sai, model tải lại từ HuggingFace | `docker volume inspect server-setup_hf_cache`; đừng `docker volume rm` volume này khi không cố ý |
-| Cùng lúc 3 app backup, máy chậm hẳn lúc 01:00-01:35 | Multica/Omnigent/Hindsight timer gần giờ nhau (đã lệch 5-15 phút có chủ đích, nhưng `RandomizedDelaySec` vẫn có thể trùng ngẫu nhiên) | `systemctl --user list-timers` xem giờ chạy thật; không phải lỗi, chỉ là trùng xác suất thấp |
+| Cùng lúc 3 app backup, máy chậm hẳn lúc 01:00-01:35 (giờ local server, xem §5) | Multica/Omnigent/Hindsight timer gần giờ nhau (đã lệch 5-15 phút có chủ đích, nhưng `RandomizedDelaySec` vẫn có thể trùng ngẫu nhiên) | `systemctl --user list-timers` xem giờ chạy thật; không phải lỗi, chỉ là trùng xác suất thấp |
 | `site trả 502/530` | cloudflared chết hoặc container down | `systemctl --user status cloudflared-hindsight` → `bin/hs ps` |
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |

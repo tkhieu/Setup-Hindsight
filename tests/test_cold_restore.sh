@@ -48,6 +48,7 @@ case "\$1" in
     shift
     case "\$*" in
       *pg_isready*) exit 0 ;;
+      *"SELECT count"*) echo 1 ;;  # trial_import_and_check's core-table check
       *pg_dump*)
         # A REALISTIC size on purpose — this is exactly the case that
         # broke when backup.sh gated on a 2048-byte floor: a freshly
@@ -91,7 +92,22 @@ HINDSIGHT_DB_NAME=$DB_NAME
 EOF
 : > "$TMP/secrets.env"
 
-printf -- '-- dummy sql dump\n' | gzip > "$TMP/fixture-dump.sql.gz"
+# A dump shaped enough to pass bin/lib/dump.sh's structural check (which
+# has its own dedicated test, test_dump_validator.sh) — this test is about
+# the cold-start ordering, not re-testing the validator.
+cat > "$TMP/fixture-dump.sql" <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+
+--
+-- PostgreSQL database dump complete
+--
+SQL
+gzip -c "$TMP/fixture-dump.sql" > "$TMP/fixture-dump.sql.gz"
 
 cd "$TMP"
 if ! out="$(./bin/restore-db.sh --yes --no-start "$TMP/fixture-dump.sql.gz" </dev/null 2>&1)"; then

@@ -2,9 +2,12 @@
 Description=Hindsight monthly database restore drill
 
 [Timer]
-# Host-local UTC: 03:30 ICT on the 15th. Offset from Omnigent's drill
-# (*-*-04 20:30:00 UTC, the 5th) by 10 days so the two monthly drills never
-# land on the same day, even with RandomizedDelaySec on both.
+# No TZ suffix -> this runs on the system's LOCAL time, whatever that is
+# set to (UTC or Asia/Saigon — check `timedatectl`; see docs/PLAYBOOK.md
+# §5/§7 for both interpretations). Offset from Omnigent's drill
+# (*-*-04 20:30:00, the 5th, same local-time caveat) by 10 days so the two
+# monthly drills never land on the same day, even with RandomizedDelaySec
+# on both.
 OnCalendar=*-*-14 20:30:00
 Persistent=true
 RandomizedDelaySec=900

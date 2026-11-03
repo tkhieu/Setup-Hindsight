@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Single source of truth for restoring the Hindsight Postgres database — a
 # real restore (replaces the live DB) and a drill (throwaway DB, never
-# touches the live DB or app) both go through this script. Fail-closed:
-# fetches and verifies the dump BEFORE touching anything, and does not
-# start hindsight back up if the restore itself fails.
+# touches the live DB or app) both go through this script, and both go
+# through the SAME trial-import check before anything destructive: a dump
+# that is gzip-valid SQL but fails to import, or imports but is missing
+# core tables, must never reach the real database. The real-restore path
+# runs that exact check into its own throwaway DB first — it is not
+# "trust gzip -t and go".
 #
 # Usage:
 #   bin/restore-db.sh [--yes] [--no-start] <source>
@@ -30,6 +33,8 @@ set -euo pipefail
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/dump.sh"
 HS="$CONFIG_DIR/bin/hs"
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -99,8 +104,8 @@ esac
 
 # ---- 1. fetch to a temp file (always cleaned up) --------------------------
 TMP="$(mktemp)"
-DRILL_DB=""
-DRILL_CREATED=0
+TRIAL_DB=""
+TRIAL_CREATED=0
 DRILL_CID=""
 # shellcheck disable=SC2329  # invoked by the EXIT trap
 cleanup_restore() {
@@ -108,9 +113,9 @@ cleanup_restore() {
   if [ -n "$DRILL_CID" ]; then
     docker rm -f "$DRILL_CID" >/dev/null 2>&1 || echo "WARNING: could not remove drill-full container $DRILL_CID — remove it manually: docker rm -f $DRILL_CID" >&2
   fi
-  if [ "$DRILL_CREATED" = 1 ]; then
-    if ! "$HS" exec -T db dropdb -U "$DB_USER" --if-exists "$DRILL_DB"; then
-      echo "ERROR: dropping $DRILL_DB failed — drop it manually: hs exec -T db dropdb -U $DB_USER $DRILL_DB" >&2
+  if [ "$TRIAL_CREATED" = 1 ]; then
+    if ! "$HS" exec -T db dropdb -U "$DB_USER" --if-exists "$TRIAL_DB"; then
+      echo "ERROR: dropping $TRIAL_DB failed — drop it manually: hs exec -T db dropdb -U $DB_USER $TRIAL_DB" >&2
       status=1
     fi
   fi
@@ -120,7 +125,7 @@ cleanup_restore() {
   fi
   if [ "$DRILL" = 1 ] && [ "$status" -eq 0 ]; then
     echo
-    echo "Drill OK — $DRILL_DB dropped."
+    echo "Drill OK — $TRIAL_DB dropped."
   fi
   exit "$status"
 }
@@ -139,64 +144,87 @@ fi
 gunzip -t "$TMP" || { echo "ERROR: dump is corrupt (gunzip -t failed)" >&2; exit 1; }
 echo "    ok: $(stat -c%s "$TMP") bytes, gzip-valid"
 
-if [ "$DRILL" = 1 ]; then
-  # ---- drill: restore into a throwaway DB; real DB/app untouched ---------
-  # Unique name per run so this can never collide with (and drop) a
-  # pre-existing database of the same name.
-  DRILL_DB="restoretest_$(date +%s)_$$"
-  say "Drill restore -> $DRILL_DB (real database and hindsight untouched)"
+say "Validating dump structure"
+# gzip -t only proves the bytes are a valid gzip stream — a gzip-valid file
+# full of plain-text garbage (not SQL at all) passes that and nothing else
+# catches it before this. assert_valid_pg_dump (bin/lib/dump.sh) checks the
+# exact pg_dump completion trailer instead of trusting the compression
+# layer alone.
+assert_valid_pg_dump "$TMP" \
+  || { echo "ERROR: dump is not a complete pg_dump output (missing/mismatched completion trailer) — refusing to import it anywhere, including a trial." >&2; exit 1; }
+echo "    ok: looks like a complete pg_dump"
 
-  "$HS" exec -T db createdb -U "$DB_USER" "$DRILL_DB"
-  DRILL_CREATED=1
-
-  if ! gunzip -c "$TMP" | "$HS" exec -T db psql -v ON_ERROR_STOP=1 -1 -f - -U "$DB_USER" -d "$DRILL_DB" -q; then
-    echo "ERROR: drill import into $DRILL_DB failed" >&2
-    exit 1
-  fi
-
-  say "Checking core tables"
-  # Confirmed table names and schema: hindsight_api/models.py
-  # __tablename__ = banks/memory_units/entities/documents.
-  #
-  # Existence is checked unconditionally for all four — that catches a
-  # corrupt dump or a schema mismatch regardless of how much data is in it.
-  # This is the ONLY check applied to memory_units/entities/documents: all
-  # three are existence-only, never row-count gated, because every one of
-  # them can be legitimately empty on a perfectly healthy dump —
-  #   - memory_units: PUT /v1/default/banks/{id} creates a bank with zero
-  #     memories; PLAYBOOK.md documents this as expected, not broken.
-  #   - entities: Entity rows come from a separate extraction step over
-  #     memory_units' content (models.py: Entity.bank_id, UnitEntity join
-  #     table) — content that yields no identifiable named entities is
-  #     normal.
-  #   - documents: MemoryUnit.document_id is nullable with no NOT NULL
-  #     constraint tying every memory unit to a document row.
-  #
-  # 'banks' is the one exception, and the ONLY row-count gate in this
-  # check: HINDSIGHT_DRILL_MIN_ROWS (default 1) is the minimum number of
-  # banks a dump must have — the "does this look like a used instance"
-  # check. Set it to 0 for a genuinely fresh install that has never had a
-  # bank created; there is no other knob here, and no other table is ever
-  # compared against it.
-  MIN_ROWS="${HINDSIGHT_DRILL_MIN_ROWS:-1}"
-  banks_count=0
+# ---- core-table check shared by the drill path and the real path's own
+# mandatory trial import (see trial_import_and_check below) -----------------
+# Confirmed table names and schema: hindsight_api/models.py
+# __tablename__ = banks/memory_units/entities/documents.
+#
+# Existence is checked unconditionally for all four — that catches a
+# corrupt dump or a schema mismatch regardless of how much data is in it.
+# This is the ONLY check applied to memory_units/entities/documents: all
+# three are existence-only, never row-count gated, because every one of
+# them can be legitimately empty on a perfectly healthy dump —
+#   - memory_units: PUT /v1/default/banks/{id} creates a bank with zero
+#     memories; PLAYBOOK.md documents this as expected, not broken.
+#   - entities: Entity rows come from a separate extraction step over
+#     memory_units' content (models.py: Entity.bank_id, UnitEntity join
+#     table) — content that yields no identifiable named entities is
+#     normal.
+#   - documents: MemoryUnit.document_id is nullable with no NOT NULL
+#     constraint tying every memory unit to a document row.
+#
+# 'banks' is the one exception, and the ONLY row-count gate in this check:
+# HINDSIGHT_DRILL_MIN_ROWS (default 1) is the minimum number of banks a
+# dump must have — the "does this look like a used instance" check. Set it
+# to 0 for a genuinely fresh install that has never had a bank created;
+# there is no other knob here, and no other table is ever compared
+# against it. Applies identically whether this runs as part of --drill or
+# as part of the real restore's own mandatory pre-flight check below.
+check_core_tables() {  # check_core_tables <db-name>
+  local db="$1" table count min_rows banks_count=0
+  min_rows="${HINDSIGHT_DRILL_MIN_ROWS:-1}"
   for table in banks memory_units entities documents; do
-    count="$("$HS" exec -T db psql -U "$DB_USER" -d "$DRILL_DB" -tAc "SELECT count(*) FROM $table;" 2>/dev/null | tr -d '[:space:]')"
+    count="$("$HS" exec -T db psql -U "$DB_USER" -d "$db" -tAc "SELECT count(*) FROM $table;" 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$count" ]; then
       echo "ERROR: table '$table' missing or unreadable in the restored dump" >&2
-      exit 1
+      return 1
     fi
     echo "    $table: $count rows"
     [ "$table" = banks ] && banks_count="$count"
   done
+  if [ "$banks_count" -lt "$min_rows" ]; then
+    echo "ERROR: 'banks' has $banks_count row(s) (< HINDSIGHT_DRILL_MIN_ROWS=$min_rows) — restored dump looks like an unused instance (set HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install)" >&2
+    return 1
+  fi
+}
 
-  if [ "$banks_count" -lt "$MIN_ROWS" ]; then
-    echo "ERROR: 'banks' has $banks_count row(s) (< HINDSIGHT_DRILL_MIN_ROWS=$MIN_ROWS) — restored dump looks like an unused instance (set HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install)" >&2
-    exit 1
+# Imports $TMP into a brand-new throwaway `restoretest_<ts>_<pid>` database
+# and runs check_core_tables against it. Sets TRIAL_DB/TRIAL_CREATED (the
+# EXIT trap above drops it on any exit, including an unexpected one) —
+# callers that want it gone sooner than script-exit drop it explicitly
+# themselves afterward. Never touches anything but its own throwaway db.
+trial_import_and_check() {
+  TRIAL_DB="restoretest_$(date +%s)_$$"
+  say "Trial import -> $TRIAL_DB (throwaway, never the real database)"
+
+  "$HS" exec -T db createdb -U "$DB_USER" "$TRIAL_DB" || return 1
+  TRIAL_CREATED=1
+
+  if ! gunzip -c "$TMP" | "$HS" exec -T db psql -v ON_ERROR_STOP=1 -1 -f - -U "$DB_USER" -d "$TRIAL_DB" -q; then
+    echo "ERROR: trial import into $TRIAL_DB failed" >&2
+    return 1
   fi
 
+  say "Checking core tables"
+  check_core_tables "$TRIAL_DB"
+}
+
+if [ "$DRILL" = 1 ]; then
+  # ---- drill: restore into a throwaway DB; real DB/app untouched ---------
+  trial_import_and_check || exit 1
+
   if [ "$DRILL_FULL" = 1 ]; then
-    say "Drill-full: booting a temporary hindsight against $DRILL_DB"
+    say "Drill-full: booting a temporary hindsight against $TRIAL_DB"
     PORT="${HINDSIGHT_DRILL_PORT:-18888}"
     api_key="${HINDSIGHT_API_TENANT_API_KEY:-}"
     [ -n "$api_key" ] || { echo "ERROR: HINDSIGHT_API_TENANT_API_KEY not set — needed to query bank counts" >&2; exit 1; }
@@ -224,7 +252,7 @@ if [ "$DRILL" = 1 ]; then
     # exported as a real shell/process env var and referenced in `-e` by
     # NAME ONLY — `docker compose run -e NAME=value` would otherwise put
     # the password straight into this process's argv (visible via `ps`).
-    export HINDSIGHT_API_DATABASE_URL="postgresql://${DB_USER}:${HINDSIGHT_DB_PASSWORD}@db:5432/${DRILL_DB}"
+    export HINDSIGHT_API_DATABASE_URL="postgresql://${DB_USER}:${HINDSIGHT_DB_PASSWORD}@db:5432/${TRIAL_DB}"
     DRILL_CID="$(docker compose -f "$CONFIG_DIR/compose.yaml" \
       --env-file "$CONFIG_DIR/version.env" --env-file "$CONFIG_DIR/base.env" --env-file "$CONFIG_DIR/secrets.env" \
       run --rm -d --no-deps -p "127.0.0.1:${PORT}:8888" \
@@ -255,17 +283,10 @@ if [ "$DRILL" = 1 ]; then
   exit 0
 fi
 
-# ---- 3. confirm -------------------------------------------------------------
-echo
-echo "About to REPLACE database '$DB_NAME' from: ${R2_KEY:-$LOCAL_PATH}"
-if [ "$YES" != 1 ]; then
-  ask "Continue?" || { echo "aborted (nothing changed)."; exit 1; }
-fi
-
-# ---- 4. ensure db is up (NOT the app) — bin/backup.sh needs a running db --
+# ---- 3. ensure db is up (NOT the app) — needed for the trial import below -
 # A truly cold restore (fresh server, nothing ever started, or recovering
 # after a crash with nothing up) would otherwise fail right here: `hs exec`
-# into a stopped/nonexistent db container errors out before any backup is
+# into a stopped/nonexistent db container errors out before anything is
 # even attempted. `up -d db` is idempotent either way — a no-op if db is
 # already running.
 say "Ensuring db is up (hindsight itself is untouched for now)"
@@ -277,7 +298,31 @@ done
 "$HS" exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1 \
   || { echo "ERROR: db did not become ready" >&2; exit 1; }
 
-# ---- 5. stop hindsight and verify it's actually stopped --------------------
+# ---- 4. mandatory trial import — before ANYTHING destructive --------------
+# A gzip-valid, structurally-plausible dump can still be invalid SQL (or SQL
+# that imports but is missing core tables) — the only way to know for sure
+# is to actually import it. This runs the exact same check --drill does,
+# into its own throwaway database, and the live database/app are not
+# touched by any of the steps below (stop, backup, DROP DATABASE, restore)
+# unless this succeeds.
+if ! trial_import_and_check; then
+  echo "ERROR: trial import failed — the live database and hindsight are untouched." >&2
+  exit 1
+fi
+echo "Trial import OK — the live database and hindsight are still untouched; proceeding with the real restore."
+if ! "$HS" exec -T db dropdb -U "$DB_USER" --if-exists "$TRIAL_DB"; then
+  echo "WARNING: could not drop trial db $TRIAL_DB — drop it manually: hs exec -T db dropdb -U $DB_USER $TRIAL_DB" >&2
+fi
+TRIAL_CREATED=0
+
+# ---- 5. confirm -------------------------------------------------------------
+echo
+echo "About to REPLACE database '$DB_NAME' from: ${R2_KEY:-$LOCAL_PATH}"
+if [ "$YES" != 1 ]; then
+  ask "Continue?" || { echo "aborted (nothing changed)."; exit 1; }
+fi
+
+# ---- 6. stop hindsight and verify it's actually stopped --------------------
 # Stopped BEFORE the backup below, not after: backing up first would leave
 # a window where a write lands after the dump but before the app actually
 # stops — gone for good the moment the next step drops the database, and
@@ -292,19 +337,22 @@ if printf '%s\n' "$running_services" | grep -qx hindsight; then
   exit 1
 fi
 
-# ---- 6. local backup — must succeed, or the whole script aborts here ------
+# ---- 7. local backup — must succeed, or the whole script aborts here ------
 say "Local backup (pre-restore) — required before touching anything"
 backup_out="$("$CONFIG_DIR/bin/backup.sh" pre-restore)"
 echo "$backup_out"
 PRE_RESTORE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
 
-# ---- 7. recreate the database -----------------------------------------------
+# ---- 8. recreate the database -----------------------------------------------
 say "Recreating database $DB_NAME"
 "$HS" exec -T db psql -v ON_ERROR_STOP=1 -U "$DB_USER" -d postgres \
   -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" \
   -c "CREATE DATABASE $DB_NAME OWNER $DB_USER;"
 
-# ---- 8. restore --------------------------------------------------------------
+# ---- 9. restore --------------------------------------------------------------
+# Already proven to import cleanly by the trial above — this should not
+# fail, but the same careful handling (single transaction, no silent
+# partial state) applies regardless.
 # -1/--single-transaction only takes effect alongside -f (or -c) — hence
 # `-f -` to read the script from stdin instead of relying on plain
 # redirection, so a failure partway through rolls the whole restore back.
@@ -316,7 +364,7 @@ if gunzip -c "$TMP" | "$HS" exec -T db psql -v ON_ERROR_STOP=1 -1 -f - -U "$DB_U
   else
     say "Starting hindsight"
     # `up -d` (create-if-missing + start), not `start` (which can only start
-    # a container that already exists) — a truly cold restore (step 4
+    # a container that already exists) — a truly cold restore (step 3
     # above) can run against a stack where hindsight's container was never
     # created at all, e.g. after `hs down` or on a fresh server; `start`
     # would silently do nothing in that case and `hs ready` would then
@@ -330,7 +378,10 @@ else
   cat >&2 <<TXT
 
 ERROR: restore failed — hindsight NOT restarted. The database is in a
-partial/unknown state (the DROP DATABASE above already ran).
+partial/unknown state (the DROP DATABASE above already ran). This should
+not happen given the trial import above already proved this exact dump
+imports cleanly — investigate the db container itself (disk space, etc.)
+before retrying.
 
 To retry, restore again from the pre-restore backup this run just made:
   bin/restore-db.sh $([ "$NO_START" = 1 ] && printf -- '--no-start ')$PRE_RESTORE_DUMP
