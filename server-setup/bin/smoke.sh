@@ -1,8 +1,25 @@
 #!/usr/bin/env bash
 # End-to-end smoke test against a running Hindsight: create a bank, retain a
-# memory, recall it, then delete the bank again. Payloads verified against
-# the v1.1.0 tag source (hindsight_api/api/http.py: CreateBankRequest,
-# RetainRequest/MemoryItem, RecallRequest).
+# durable fact, confirm it was actually extracted into a memory unit, recall
+# it, then always delete the bank again (success or failure). Payloads
+# verified against the v1.1.0 tag source (hindsight_api/api/http.py:
+# CreateBankRequest, RetainRequest/MemoryItem, RetainResponse,
+# ListMemoryUnitsResponse, RecallRequest/RecallResponse).
+#
+# retain's response (RetainResponse) only reports items_count — the number
+# of items *submitted*, not the number of facts the LLM actually extracted
+# and stored — so a retained-but-forgettable sentence (e.g. "smoke test
+# memory created at <timestamp>") can get items_count=1 while the extractor
+# keeps zero of it. We retain a clearly durable, specific statement instead,
+# and separately confirm >=1 memory unit landed in the bank via
+# GET .../memories/list before trusting recall to find anything.
+#
+# recall's extraction is concise and may paraphrase or drop incidental detail,
+# so we never require a literal substring of the retained sentence to survive
+# into the recall result. This bank was just created and holds nothing else,
+# so any non-empty `results` array from recall against it is already proof
+# recall found the fact just retained; whether a word from the fact (e.g.
+# "Hanoi") literally survived is reported but never required for a pass.
 #
 # Usage: bin/smoke.sh
 set -euo pipefail
@@ -50,25 +67,60 @@ req() {  # req <method> <path> [json-body]
   echo "$body_out"
 }
 
-say "1/4 Create bank $BANK_ID"
+cleanup() {
+  local rc=$?
+  say "Cleanup: deleting bank $BANK_ID"
+  if ! req DELETE "/v1/default/banks/$BANK_ID" >/dev/null 2>&1; then
+    echo "WARNING: failed to delete smoke bank $BANK_ID (may require manual cleanup)" >&2
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
+say "1/5 Create bank $BANK_ID"
 req PUT "/v1/default/banks/$BANK_ID" '{}' >/dev/null
 
-say "2/4 Retain a memory"
-retain_body=$(cat <<JSON
-{"items": [{"content": "Smoke test memory created by bin/smoke.sh at $(date -Iseconds)."}]}
+say "2/5 Retain a durable fact"
+retain_body=$(cat <<'JSON'
+{"items": [{"content": "The smoke-test user prefers green tea and lives in Hanoi."}], "async": false}
 JSON
 )
 req POST "/v1/default/banks/$BANK_ID/memories" "$retain_body" >/dev/null
 
-say "3/4 Recall it"
-recall_out="$(req POST "/v1/default/banks/$BANK_ID/memories/recall" '{"query": "smoke test"}')"
-echo "$recall_out"
-if ! printf '%s' "$recall_out" | grep -qi "smoke test"; then
-  echo "ERROR: recall did not surface the memory just retained" >&2
+say "3/5 Verify retain extracted at least one memory unit"
+list_out="$(req GET "/v1/default/banks/$BANK_ID/memories/list?limit=1")"
+total="$(printf '%s' "$list_out" | grep -o '"total"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$' || true)"
+if [ -z "$total" ]; then
+  echo "ERROR: could not find a 'total' field in the memories/list response:" >&2
+  echo "$list_out" >&2
   exit 1
 fi
+if [ "$total" -lt 1 ]; then
+  echo "ERROR: retain extracted 0 facts (LLM returned nothing worth keeping) from a sentence meant to be durable" >&2
+  exit 1
+fi
+echo "memory units in bank: $total"
 
-say "4/4 Delete bank $BANK_ID (cleanup)"
-req DELETE "/v1/default/banks/$BANK_ID" >/dev/null
+say "4/5 Recall it"
+recall_body=$(cat <<'JSON'
+{"query": "Where does the smoke-test user live, and what do they prefer to drink?"}
+JSON
+)
+recall_out="$(req POST "/v1/default/banks/$BANK_ID/memories/recall" "$recall_body")"
+echo "$recall_out"
+if ! printf '%s' "$recall_out" | grep -q '"results"'; then
+  echo "ERROR: recall response has no 'results' field:" >&2
+  echo "$recall_out" >&2
+  exit 1
+fi
+if printf '%s' "$recall_out" | grep -Eq '"results"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]'; then
+  echo "ERROR: recall returned 0 results for a fact just confirmed present in bank $BANK_ID (retain worked, recall and retain disagree)" >&2
+  exit 1
+fi
+if printf '%s' "$recall_out" | grep -qi "hanoi"; then
+  echo "recall result mentions 'Hanoi' (expected content present)"
+else
+  echo "NOTE: recall result did not literally contain 'Hanoi' (non-fatal: recall may paraphrase or condense)"
+fi
 
 say "Smoke test OK"

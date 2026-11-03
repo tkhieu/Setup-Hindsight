@@ -43,7 +43,8 @@ cat >/dev/null
 url=""
 for a in "\$@"; do url="\$a"; done
 case "\$url" in
-  *memories/recall) printf '{"results":[{"text":"smoke test memory"}]}\n200\n' ;;
+  *memories/recall) printf '{"results":[{"text":"The smoke-test user prefers green tea and lives in Hanoi."}]}\n200\n' ;;
+  *memories/list*) printf '{"items":[{"id":"x"}],"total":1,"limit":1,"offset":0}\n200\n' ;;
   *) printf '{}\n200\n' ;;
 esac
 EOF
@@ -68,7 +69,7 @@ fi
 # which this test does not log) by checking the log recorded the expected
 # number of requests — a no-op log would also "pass" the grep above for
 # the wrong reason (nothing ran at all).
-[ "$(wc -l < "$CURL_LOG_1")" -ge 4 ] || { echo "smoke.sh: expected at least 4 curl calls, got:"; cat "$CURL_LOG_1"; exit 1; }
+[ "$(wc -l < "$CURL_LOG_1")" -ge 5 ] || { echo "smoke.sh: expected at least 5 curl calls, got:"; cat "$CURL_LOG_1"; exit 1; }
 
 rm -rf "$T1"
 echo "ok - smoke.sh"
