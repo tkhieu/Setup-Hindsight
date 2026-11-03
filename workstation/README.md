@@ -4,13 +4,13 @@ Installer dùng tích hợp chính thức `@vectorize-io/hindsight-coding-agents
 
 ## Cài qua marketplace
 
-Repo GitHub này là private: trên mỗi máy, đăng nhập `gh auth login` cho HTTPS hoặc cấu hình SSH key/agent có quyền đọc repo trước khi thêm marketplace. Claude Code và Codex dùng git credentials sẵn có; lệnh thêm marketplace không hỏi mật khẩu tương tác. Sau khi PR này được merge vào nhánh mặc định:
+Repo GitHub này là private: trên mỗi máy cần Git credentials có quyền đọc repo. Claude Code thử SSH trước với dạng `owner/repo`; hãy cấu hình SSH key/agent trước. Codex CLI hiện dùng HTTPS cho dạng `owner/repo`, nên ví dụ dưới dùng SSH URL để phù hợp với máy đã xác thực SSH. Nếu muốn dùng HTTPS với Codex, cần cấu hình Git credential helper cho tài khoản GitHub; đăng nhập `gh` riêng chưa đủ. Sau khi PR này được merge vào nhánh mặc định:
 
 ```sh
 claude plugin marketplace add tkhieu/Setup-Hindsight
 claude plugin install hindsight-client@setup-hindsight
 
-codex plugin marketplace add tkhieu/Setup-Hindsight
+codex plugin marketplace add git@github.com:tkhieu/Setup-Hindsight.git
 codex plugin add hindsight-client@setup-hindsight
 ```
 
