@@ -42,13 +42,14 @@ và không đưa key vào tham số dòng lệnh:
 ```bash
 install -d -m 700 ~/.config/hindsight
 ( umask 077
+  touch ~/.config/hindsight/client.env && chmod 600 ~/.config/hindsight/client.env
   K=$(ssh hieu@100.77.187.94 "grep '^HINDSIGHT_API_TENANT_API_KEY=' ~/hindsight/server-setup/secrets.env | cut -d= -f2-")
   printf 'HINDSIGHT_URL=https://hindsight-api.hieutk.dev\nHINDSIGHT_API_KEY=%s\n' "$K" > ~/.config/hindsight/client.env
   unset K )
 grep -c '^HINDSIGHT_API_KEY=.' ~/.config/hindsight/client.env   # phải in ra 1
 ```
 
-Lệnh này ghi đè `client.env` nếu file đã có. Biến môi trường `HINDSIGHT_URL`,
+Lệnh này ghi đè `client.env` nếu file đã có, và đặt quyền `600` trước khi ghi key (kể cả khi file cũ đang mở rộng hơn). Biến môi trường `HINDSIGHT_URL`,
 `HINDSIGHT_API_KEY`, `HINDSIGHT_BANK` (nếu đặt) ghi đè giá trị trong file.
 
 **Bank:** mặc định `user-<tên đăng nhập>`, Claude Code và Codex dùng chung. Muốn
