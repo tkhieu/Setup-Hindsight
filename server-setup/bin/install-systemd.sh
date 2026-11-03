@@ -76,6 +76,8 @@ install_units() {
              "$CONFIG_DIR"/systemd/hindsight-backup@monthly.timer \
              "$CONFIG_DIR"/systemd/hindsight-restore-drill.service \
              "$CONFIG_DIR"/systemd/hindsight-restore-drill.timer \
+             "$CONFIG_DIR"/systemd/hindsight-upgrade-check.service \
+             "$CONFIG_DIR"/systemd/hindsight-upgrade-check.timer \
              "$CONFIG_DIR"/cloudflared/cloudflared-hindsight.service; do
     name="$(basename "$src")"
     if [ "$DRY_RUN" = 1 ]; then
@@ -129,6 +131,7 @@ enable_timers() {
     run systemctl --user enable --now "hindsight-backup@${mode}.timer"
   done
   run systemctl --user enable --now hindsight-restore-drill.timer
+  run systemctl --user enable --now hindsight-upgrade-check.timer
   # Enabled but not started: needs a tunnel UUID + credentials file created
   # by hand first — see docs/PLAYBOOK.md §4.
   run systemctl --user enable cloudflared-hindsight.service
@@ -155,7 +158,7 @@ say "done"
 if [ "$DRY_RUN" = 1 ]; then
   echo "dry run only — nothing was installed or enabled."
 else
-  echo "check with: systemctl --user list-timers 'hindsight-backup@*' hindsight-restore-drill.timer"
+  echo "check with: systemctl --user list-timers 'hindsight-backup@*' hindsight-restore-drill.timer hindsight-upgrade-check.timer"
   echo "cloudflared: create the tunnel + credentials file (docs/PLAYBOOK.md §4), then:"
   echo "  systemctl --user start cloudflared-hindsight"
 fi

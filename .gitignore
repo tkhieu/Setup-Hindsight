@@ -4,3 +4,4 @@ secrets.env
 backups/
 .jacky/
 .worktrees/
+server-setup/.ops.lock

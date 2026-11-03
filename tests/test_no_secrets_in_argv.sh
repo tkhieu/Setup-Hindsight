@@ -83,6 +83,7 @@ mkdir -p "$T2/bin/lib" "$T2/fakebin"
 cp "$SS/bin/restore-db.sh" "$T2/bin/restore-db.sh"
 cp "$SS/bin/lib/env.sh" "$T2/bin/lib/env.sh"
 cp "$SS/bin/lib/dump.sh" "$T2/bin/lib/dump.sh"
+cp "$SS/bin/lib/lock.sh" "$T2/bin/lib/lock.sh"
 chmod +x "$T2/bin/restore-db.sh"
 
 HS_LOG_2="$T2/hs.log"

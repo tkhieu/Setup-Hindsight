@@ -15,6 +15,9 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 . "$CONFIG_DIR/bin/lib/env.sh"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/dump.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/lock.sh"
+acquire_ops_lock "$CONFIG_DIR"
 HS="$CONFIG_DIR/bin/hs"
 BACKUP_DIR="${HINDSIGHT_BACKUP_DIR:-$CONFIG_DIR/backups}"
 LABEL="${1:-manual}"

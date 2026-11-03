@@ -14,6 +14,7 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/backup-r2.sh" "$TMP/bin/backup-r2.sh"
 cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
+cp "$SS/bin/lib/lock.sh" "$TMP/bin/lib/lock.sh"
 chmod +x "$TMP/bin/backup-r2.sh"
 
 # Fake hs: only `exec ... pg_dump` is exercised by backup-r2.sh (6h mode).

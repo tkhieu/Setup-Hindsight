@@ -35,6 +35,8 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 . "$CONFIG_DIR/bin/lib/env.sh"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/dump.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/lock.sh"
 HS="$CONFIG_DIR/bin/hs"
 
 say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -57,6 +59,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$SOURCE" ] || { echo "usage: restore-db.sh [--yes] [--no-start] <source>   (or --drill [--drill-full] <source>)" >&2; exit 1; }
+
+# Taken for real restore AND --drill alike (incl. as upgrade.sh's
+# auto-rollback child, or the monthly drill timer) — serializes against
+# every other backup/restore/upgrade/check-upstream run.
+acquire_ops_lock "$CONFIG_DIR"
 
 set -a
 # shellcheck disable=SC1091
