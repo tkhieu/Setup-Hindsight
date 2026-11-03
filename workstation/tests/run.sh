@@ -2,6 +2,7 @@
 set -eu
 
 root=$(dirname "$(dirname "$(readlink -f "$0")")")
+repo_root=$(dirname "$root")
 installer=$root/bin/hindsight-client-setup
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
@@ -154,4 +155,24 @@ pass 'missing Codex features table gives actionable warning'
 ! grep -aFq "$HINDSIGHT_API_KEY" "$ARGV_LOG" || fail 'secret appeared in child process argv'
 pass 'curl, npx, claude, and codex argv never contain the key'
 
-printf '9 test cases passed\n'
+claude_marketplace=$repo_root/.claude-plugin/marketplace.json
+codex_marketplace=$repo_root/.agents/plugins/marketplace.json
+plugin_dir=$repo_root/plugins/hindsight-client
+jq -e '.name == "setup-hindsight" and .plugins[0].name == "hindsight-client" and .plugins[0].source == "./plugins/hindsight-client"' "$claude_marketplace" >/dev/null || fail 'Claude marketplace manifest'
+jq -e '.name == "setup-hindsight" and .plugins[0].name == "hindsight-client" and .plugins[0].source.path == "./plugins/hindsight-client"' "$codex_marketplace" >/dev/null || fail 'Codex marketplace manifest'
+jq -e '.name == "hindsight-client" and .version == "0.1.0"' "$plugin_dir/.claude-plugin/plugin.json" >/dev/null || fail 'Claude plugin version'
+jq -e '.name == "hindsight-client" and .version == "0.1.0"' "$plugin_dir/plugin.json" >/dev/null || fail 'Codex plugin version'
+jq -e '.extensions["com.openai"].onboardingSkill == "./skills/setup-hindsight-client/SKILL.md"' "$plugin_dir/plugin.json" >/dev/null || fail 'Codex onboarding path'
+[ -f "$plugin_dir/skills/setup-hindsight-client/SKILL.md" ] || fail 'packaged skill missing'
+[ -x "$plugin_dir/scripts/hindsight-client-setup" ] || fail 'packaged installer missing'
+[ ! -e "$plugin_dir/mcp.json" ] && [ ! -e "$plugin_dir/.mcp.json" ] || fail 'plugin unexpectedly bundles MCP'
+pass 'both marketplace manifests parse and reference the packaged skill and installer'
+
+export HOME="$scratch/plugin-home"
+mkdir -p "$HOME"
+HINDSIGHT_CLIENT_PLUGIN_MODE=1 "$plugin_dir/scripts/hindsight-client-setup" install > "$scratch/output" 2>&1 || fail 'plugin installer exit'
+[ ! -e "$HOME/.claude/skills/setup-hindsight-client" ] || fail 'plugin mode duplicated Claude skill'
+[ ! -e "$HOME/.codex/skills/setup-hindsight-client" ] || fail 'plugin mode duplicated Codex skill'
+pass 'marketplace script uses packaged skill without duplicate symlinks'
+
+printf '11 test cases passed\n'

@@ -2,6 +2,22 @@
 
 Installer dùng tích hợp chính thức `@vectorize-io/hindsight-coding-agents@0.8.2` (bản đi cùng Hindsight server v1.1.0) và tắt tự cập nhật để giữ đúng phiên bản. Tích hợp đăng ký MCP và hooks tự nhớ/tự gọi lại cho Claude Code (user scope) và Codex. Cả hai dùng chung một bank, mặc định `user-<tên đăng nhập>`; đổi `HINDSIGHT_BANK` nếu cần chia sẻ giữa các máy hoặc tách dữ liệu. Mặc định này đơn giản cho một người dùng, nhưng các dự án cùng bank sẽ chia sẻ ký ức.
 
+## Cài qua marketplace
+
+Repo GitHub này là private: trên mỗi máy, đăng nhập `gh auth login` cho HTTPS hoặc cấu hình SSH key/agent có quyền đọc repo trước khi thêm marketplace. Claude Code và Codex dùng git credentials sẵn có; lệnh thêm marketplace không hỏi mật khẩu tương tác. Sau khi PR này được merge vào nhánh mặc định:
+
+```sh
+claude plugin marketplace add tkhieu/Setup-Hindsight
+claude plugin install hindsight-client@setup-hindsight
+
+codex plugin marketplace add tkhieu/Setup-Hindsight
+codex plugin add hindsight-client@setup-hindsight
+```
+
+Trong phiên Claude Code có thể dùng `/plugin marketplace add tkhieu/Setup-Hindsight`, rồi `/plugin install hindsight-client@setup-hindsight`; lệnh thứ hai mở màn hình chọn scope. Skill xuất hiện dưới tên `/hindsight-client:setup-hindsight-client`. Sau khi cài plugin, dùng skill để chạy `scripts/hindsight-client-setup` nằm ngay trong plugin, hoặc chạy script đó trực tiếp với `HINDSIGHT_CLIENT_PLUGIN_MODE=1` để tránh skill symlink trùng. Plugin cung cấp skill và script, còn kết nối MCP cùng hooks do gói tích hợp chính thức cài tại máy người dùng. Như vậy API key chỉ nằm trong cấu hình máy, không nằm trong manifest hoặc git; đóng gói MCP/hooks riêng sẽ tạo đăng ký trùng.
+
+## Cài từ bản checkout
+
 ```sh
 workstation/bin/hindsight-client-setup --dry-run
 workstation/bin/hindsight-client-setup install

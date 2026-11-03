@@ -1,0 +1,22 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hindsight-client",
+  "version": "0.1.0",
+  "description": "Cài đặt, kiểm tra và gỡ Hindsight self-hosted trên máy phát triển.",
+  "author": {
+    "name": "tkhieu"
+  },
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/setup-hindsight-client/SKILL.md",
+      "interface": {
+        "displayName": "Hindsight Client Setup",
+        "shortDescription": "Cài Hindsight self-hosted",
+        "longDescription": "Hướng dẫn và script cài đặt Hindsight cho Claude Code và Codex trên máy phát triển.",
+        "developerName": "tkhieu",
+        "category": "Developer Tools",
+        "capabilities": []
+      }
+    }
+  }
+}
