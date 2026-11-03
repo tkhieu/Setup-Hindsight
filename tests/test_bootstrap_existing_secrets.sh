@@ -76,4 +76,44 @@ for key in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCES
   [ ! -s "$CALLS" ]
 done
 
+# Space-only values and CRLF blanks must be filled on their existing lines.
+for format in spaces crlf; do
+  if [ "$format" = spaces ]; then
+    sed 's/^HINDSIGHT_DB_PASSWORD=$/HINDSIGHT_DB_PASSWORD=   /' "$TMP/original" > "$TMP/secrets.env"
+  else
+    awk '{ printf "%s\r\n", $0 }' "$TMP/original" > "$TMP/secrets.env"
+  fi
+  cp "$TMP/secrets.env" "$TMP/before-blank"
+  "$TMP/bin/bootstrap.sh" > "$TMP/out" 2> "$TMP/err"
+  awk -F= '
+    /^HINDSIGHT_(DB_PASSWORD|API_TENANT_API_KEY|CP_ACCESS_KEY)=/ {
+      sub(/\r$/, "", $2)
+      if (length($2) != 64) exit 1
+      count[$1]++
+      n++
+    }
+    END {
+      if (n != 3) exit 1
+      for (key in count) if (count[key] != 1) exit 1
+    }
+  ' "$TMP/secrets.env"
+  awk '!/^HINDSIGHT_(DB_PASSWORD|API_TENANT_API_KEY|CP_ACCESS_KEY)=/' "$TMP/before-blank" > "$TMP/other-original"
+  awk '!/^HINDSIGHT_(DB_PASSWORD|API_TENANT_API_KEY|CP_ACCESS_KEY)=/' "$TMP/secrets.env" > "$TMP/other-after"
+  cmp "$TMP/other-original" "$TMP/other-after"
+  for key in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+    if [ "$format" = spaces ]; then
+      sed "s/^$key=.*/$key=   /" "$TMP/first-run" > "$TMP/secrets.env"
+    else
+      awk -v key="$key" '{ if (index($0, key "=") == 1) $0 = key "="; printf "%s\r\n", $0 }' "$TMP/first-run" > "$TMP/secrets.env"
+    fi
+    : > "$CALLS"
+    if "$TMP/bin/chatgpt-login.sh" --status > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
+    grep -q 'bin/bootstrap.sh first' "$TMP/err"
+    [ ! -s "$CALLS" ]
+    if "$TMP/bin/chatgpt-login.sh" > "$TMP/out" 2> "$TMP/err"; then exit 1; fi
+    grep -q 'bin/bootstrap.sh first' "$TMP/err"
+    [ ! -s "$CALLS" ]
+  done
+done
+
 echo ok

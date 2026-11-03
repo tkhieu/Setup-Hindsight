@@ -27,12 +27,21 @@ fi
 chmod 600 "$CONFIG_DIR/secrets.env"
 generated=0
 for k in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-  if [ -z "$(env_get "$CONFIG_DIR/secrets.env" "$k")" ]; then
+  if env_is_blank "$CONFIG_DIR/secrets.env" "$k"; then
     (
       secret_tmp="$(mktemp "$CONFIG_DIR/.secrets.env.XXXXXX")"
       trap 'rm -f "$secret_tmp"' EXIT
       GENERATED_SECRET="$(openssl rand -hex 32)" awk -v key="$k" '
-        $0 == key "=" { print key "=" ENVIRON["GENERATED_SECRET"]; found = 1; next }
+        index($0, key "=") == 1 {
+          value = substr($0, length(key) + 2)
+          gsub(/\r/, "", value)
+          if (value ~ /^[[:space:]]*$/) {
+            ending = (substr($0, length($0), 1) == "\r" ? "\r" : "")
+            print key "=" ENVIRON["GENERATED_SECRET"] ending
+            found = 1
+            next
+          }
+        }
         { print }
         END { if (!found) print key "=" ENVIRON["GENERATED_SECRET"] }
       ' "$CONFIG_DIR/secrets.env" > "$secret_tmp"
@@ -46,8 +55,7 @@ done
 if [ "$generated" -eq 0 ]; then echo "all generated secrets already set"; fi
 
 provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
-llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
-if [ "$provider" != chatgpt ] && [ -z "$llm_key" ]; then
+if [ "$provider" != chatgpt ] && env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY; then
   cat <<TXT
 
 Chưa chạy được: HINDSIGHT_API_LLM_API_KEY còn trống trong secrets.env (provider ${provider:-openai}).

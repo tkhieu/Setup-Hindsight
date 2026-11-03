@@ -8,7 +8,7 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 check_generated_secrets() {
   local key
   for key in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-    if [ ! -f "$CONFIG_DIR/secrets.env" ] || [ -z "$(env_get "$CONFIG_DIR/secrets.env" "$key")" ]; then
+    if [ ! -f "$CONFIG_DIR/secrets.env" ] || env_is_blank "$CONFIG_DIR/secrets.env" "$key"; then
       echo "chatgpt-login: $key is missing or empty in secrets.env — run bin/bootstrap.sh first." >&2
       exit 1
     fi
