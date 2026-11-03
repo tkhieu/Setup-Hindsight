@@ -20,21 +20,30 @@ docker compose version >/dev/null 2>&1 \
 mkdir -p "$CONFIG_DIR/backups"
 
 say "Generating secrets"
-if [ -f "$CONFIG_DIR/secrets.env" ]; then
-  echo "secrets.env already exists — leaving it as-is."
-else
-  umask 077
+umask 077
+if [ ! -f "$CONFIG_DIR/secrets.env" ]; then
   cp "$CONFIG_DIR/secrets.env.example" "$CONFIG_DIR/secrets.env"
-  chmod 600 "$CONFIG_DIR/secrets.env"
-  for k in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-    # Keep generated values in the file stream, never in sed's argv.
-    sed -i "/^${k}=\$/d" "$CONFIG_DIR/secrets.env"
-    printf '%s=' "$k" >> "$CONFIG_DIR/secrets.env"
-    openssl rand -hex 32 >> "$CONFIG_DIR/secrets.env"
-  done
-  echo "generated HINDSIGHT_DB_PASSWORD, HINDSIGHT_API_TENANT_API_KEY, HINDSIGHT_CP_ACCESS_KEY -> secrets.env (chmod 600)"
-  echo "OpenAI key is needed only if provider=openai. Fill RCLONE_CONFIG_R2_* and CLOUDFLARED_CREDENTIALS_FILE before enabling backup/tunnel."
 fi
+chmod 600 "$CONFIG_DIR/secrets.env"
+generated=0
+for k in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+  if [ -z "$(env_get "$CONFIG_DIR/secrets.env" "$k")" ]; then
+    (
+      secret_tmp="$(mktemp "$CONFIG_DIR/.secrets.env.XXXXXX")"
+      trap 'rm -f "$secret_tmp"' EXIT
+      GENERATED_SECRET="$(openssl rand -hex 32)" awk -v key="$k" '
+        $0 == key "=" { print key "=" ENVIRON["GENERATED_SECRET"]; found = 1; next }
+        { print }
+        END { if (!found) print key "=" ENVIRON["GENERATED_SECRET"] }
+      ' "$CONFIG_DIR/secrets.env" > "$secret_tmp"
+      chmod 600 "$secret_tmp"
+      mv "$secret_tmp" "$CONFIG_DIR/secrets.env"
+    )
+    echo "generated $k"
+    generated=1
+  fi
+done
+if [ "$generated" -eq 0 ]; then echo "all generated secrets already set"; fi
 
 provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
 llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"

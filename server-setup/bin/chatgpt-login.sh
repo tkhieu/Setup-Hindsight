@@ -3,7 +3,19 @@
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/env.sh"
+check_generated_secrets() {
+  local key
+  for key in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+    if [ ! -f "$CONFIG_DIR/secrets.env" ] || [ -z "$(env_get "$CONFIG_DIR/secrets.env" "$key")" ]; then
+      echo "chatgpt-login: $key is missing or empty in secrets.env — run bin/bootstrap.sh first." >&2
+      exit 1
+    fi
+  done
+}
 compose() {
+  check_generated_secrets
   docker compose -f "$CONFIG_DIR/compose.yaml" \
     --env-file "$CONFIG_DIR/version.env" \
     --env-file "$CONFIG_DIR/base.env" \

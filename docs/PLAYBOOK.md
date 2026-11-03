@@ -97,13 +97,15 @@ Chạy trên server, trong `~/hindsight/server-setup`:
 ssh hieu@100.77.187.94
 mkdir -p ~/hindsight && cd ~/hindsight
 git clone git@github.com:tkhieu/Setup-Hindsight.git .
+git pull --ff-only
 cd server-setup
 bin/bootstrap.sh
 ```
 
 `bootstrap.sh` tự sinh `HINDSIGHT_DB_PASSWORD`, `HINDSIGHT_API_TENANT_API_KEY`,
 `HINDSIGHT_CP_ACCESS_KEY` (bằng `openssl rand -hex 32`) vào `secrets.env`
-(chmod 600). Lần đầu với `chatgpt`, `bootstrap.sh`
+(chmod 600); nếu file đã tồn tại, script điền các secret tự sinh còn thiếu hoặc trống.
+Lần đầu với `chatgpt`, `bootstrap.sh`
 nhắc cài credential và dừng trước khi khởi động API. Làm §4.2 rồi chạy lại
 `bin/bootstrap.sh` (giữ nguyên secret đã sinh).
 
@@ -499,6 +501,7 @@ rồi chạy `bin/smoke.sh`.
 | `bin/hs ready` fail ngay sau `up -d` | container cần vài giây để migration chạy xong | mặc định chờ tới 60s; `HINDSIGHT_READY_TIMEOUT=180 bin/hs ready` nếu cần lâu hơn |
 | `hs up` báo thiếu secret và dừng | `secrets.env` thiếu file, tenant/UI key trống, hoặc provider API-key thiếu `HINDSIGHT_API_LLM_API_KEY` | `bin/bootstrap.sh` (idempotent); với OpenAI điền key |
 | `hs up` báo ChatGPT credentials thiếu | chưa chuyển credential hoặc plan scope chưa được cấp | làm lại §4.2; kiểm `bin/chatgpt-login.sh --status` |
+| `hindsight-admin chatgpt login` báo `Fetching OpenAI JWKS returned HTTP 503` | OpenAI tạm thời không phục vụ JWKS | thử lại sau; kiểm `chatgpt status` thành công trên máy dev trước khi chuyển credential |
 | Retain/recall báo refresh token invalid | session ChatGPT hết hiệu lực | đăng nhập lại trên máy dev, chuyển lại bằng `bin/chatgpt-login.sh`, sau đó `logout --local-only` trên máy dev |
 | Retain/recall bị trì hoãn khi hết hạn mức Pro | ChatGPT plan đã hết usage trong chu kỳ | xem ChatGPT Settings → Usage; Hindsight hoãn retain/consolidation rồi thử lại sau 30 phút |
 | Retain/recall lỗi với provider OpenAI | API key sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
