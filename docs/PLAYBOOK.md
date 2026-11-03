@@ -6,7 +6,6 @@ Tài liệu để **vận hành** server Hindsight (agent memory của Vectorize
 
 Kết nối agent trên máy dev (Claude Code, Codex, …) vào Hindsight qua MCP:
 xem `workstation/` (đang làm ở PR khác trong cùng repo) — không lặp lại ở đây.
-
 ---
 
 ## 1. Kiến trúc trong 1 phút
@@ -46,7 +45,6 @@ healthcheck.
 cross-encoder. Vì bỏ neural reranking, độ chính xác thứ hạng có thể khác;
 kiểm tra các truy vấn recall thực tế sau khi chuyển. Key OpenAI có chi phí theo
 token embedding, gồm cả lần re-embed toàn bộ dữ liệu; đặt ngân sách/alert nhỏ.
-
 ---
 
 ## 2. Truy cập
@@ -66,7 +64,6 @@ Hai secret khác nhau, đừng nhầm:
   toàn tách biệt. UI dùng chính API key ở trên (qua
   `HINDSIGHT_CP_DATAPLANE_API_KEY`, set giống nhau trong `compose.yaml`) để
   tự gọi API cho chính nó — không phải thứ bạn gõ khi login.
-
 ---
 
 ## 3. Lệnh hằng ngày
@@ -124,7 +121,6 @@ docker volume rm server-setup_pgdata server-setup_hf_cache server-setup_chatgpt_
 
 Không xóa volume `server-setup_hub-db-data`,
 `server-setup_hub-db-timescale-data` hay network `server-setup_default`.
-
 ---
 
 ## 4. Cài lần đầu (một lần)
@@ -304,7 +300,6 @@ không đổi `HINDSIGHT_API_LLM_API_KEY` (ChatGPT OAuth). Nếu log báo dimens
 mismatch: dừng app, chạy `reembed.sh --yes` khi DB vẫn là bản cũ, hoặc restore
 dump pre-switch và làm lại. Nếu import fail, script cố khôi phục tên DB cũ,
 giữ archive và dump; xem log, kiểm tra DB trước khi thử lại.
-
 ---
 
 ## 5. Backup
@@ -384,7 +379,6 @@ trước khi restore (§6) fail trên đúng server mới cài.
 theo bucket không có quyền `CreateBucket`, mà rclone mặc định gọi nó để
 kiểm tra bucket tồn tại trước khi upload → mọi lần ghi fail với
 `CreateBucket 403 AccessDenied`. Lỗi này trông hệt như credential sai.
-
 ---
 
 ## 6. Restore (thật)
@@ -449,7 +443,6 @@ TRƯỚC khi đụng gì tới DB thật hay dừng app; destructive thật sự
 
 Nếu bước 11 fail: hindsight **không** được start lại, script in sẵn lệnh
 restore lại từ bản pre-restore vừa tạo ở bước 9.
-
 ---
 
 ## 7. Diễn tập restore
@@ -539,7 +532,6 @@ systemctl --user start hindsight-restore-drill   # chạy ngay, không đợi l�
   nhận; nếu vẫn lệch, nghi ngờ dump bị thiếu dữ liệu.
 - Chạy tay bất cứ lúc nào để xác minh ngay sau một thay đổi lớn (migration,
   nâng version) thay vì đợi lịch hằng tháng.
-
 ---
 
 ## 8. Upgrade + Rollback
@@ -599,73 +591,36 @@ rồi chạy `bin/smoke.sh`.
 
 ```bash
 bin/check-upstream.sh             # chạy tay, giống hệt lịch tự động
-bin/check-upstream.sh --dry-run   # chỉ đọc (release info, GHCR tag) — không upgrade/issue/push
+bin/check-upstream.sh --dry-run   # chỉ đọc (release info, GHCR tag) — không upgrade/gửi tin/push
 ```
 
-**Tự động vs thủ công — HUMAN DECISION cố định trong script, không có cờ
-nào đổi được:**
+**Điều kiện trước:** cài `ops-notify` từ `Setup-Omnigent/docs/RUNBOOK.md §8`
+(PR `tkhieu/Setup-Omnigent#38`) trên server. CLI nằm ở
+`~/.local/bin/ops-notify`; template `ops-notify@.service` cũng được cài ở đó. Kiểm bằng `~/.local/bin/ops-notify --test` và xác nhận Telegram nhận tin. Không lưu token Telegram trong repo này.
 
-- **PATCH** (cùng MAJOR.MINOR, PATCH cao hơn, ví dụ `1.1.0 -> 1.1.1`): tự
-  động chạy `bin/upgrade.sh --yes --auto-rollback --smoke <ver>`; thành
-  công thì tự commit + push `version.env` (deploy key read-write đã cấu
-  hình sẵn trên server, host alias `github-setup-hindsight`) và mở issue.
-- **MINOR/MAJOR**: **không bao giờ** tự áp dụng — chỉ mở issue kèm link
-  release + lệnh chạy tay (`bin/upgrade.sh <ver>`, vẫn hỏi xác nhận như
-  bình thường).
-- Prerelease/draft và version cũ hơn hiện tại: bỏ qua lặng lẽ (`exit 0`,
-  không issue).
-- Lỗi gọi API GitHub lúc lấy release (403/5xx) hoặc không thấy tag trên
-  GHCR: log lỗi, `exit 1`, **không** mở issue — tránh spam khi chính bước
-  kiểm tra bị lỗi.
-- Lỗi gọi API GitHub ở BẤT KỲ bước nào liên quan tới issue (tạo label khác
-  422 "đã tồn tại", liệt kê issue để chống trùng, tạo issue) cũng luôn
-  `exit` khác 0, và **không bao giờ tạo issue sau một lượt tìm-trùng bị
-  lỗi** (lượt tìm đó chính là thứ duy nhất chặn việc tạo trùng — lỗi ở đó
-  mà vẫn tạo tiếp thì mất hết tác dụng chống trùng).
-  - 422 ở bước tạo label CHỈ được hiểu là "label đã tồn tại" nếu body lỗi
-    thật sự chứa `errors[].code == "already_exists"` — một 422 khác (ví dụ
-    màu label sai) vẫn fail như bình thường, không bị nuốt lặng lẽ.
-  - Body trả về HTTP 200 nhưng KHÔNG phải JSON array hợp lệ (JSON hỏng,
-    hoặc là object lỗi) bị coi là LỖI API, không phải "0 issue tìm thấy" —
-    coi nó là danh sách rỗng mới chính là lỗ hổng chống trùng thật sự.
-- Repo trên server dirty, hoặc không đang ở branch `main`, hoặc `main` lệch
-  so với `origin/main` (không fast-forward được): không tự upgrade, mở
-  issue "...auto-upgrade blocked (repo not clean)" thay vào đó.
-- Upgrade xong + push thành công, nhưng việc MỞ ISSUE báo tin lại lỗi: vẫn
-  `exit` khác 0 (để biết mà xem log/journal), nhưng **không** rollback —
-  hindsight đã khoẻ trên version mới, đây chỉ là lỗi thông báo.
-- **Chống trùng issue:** mọi issue gắn label `hindsight-upgrade`; trước khi
-  tạo mới, script liệt kê TẤT CẢ issue có label đó ở **MỌI trạng thái**
-  (`state=all` — cả đã đóng, không chỉ đang mở) qua REST API, phân trang
-  (`per_page=100`, lặp trang tới khi rỗng) cho tới khi tìm đúng title khớp
-  y chang — có rồi (dù đang mở hay đã đóng) thì không tạo thêm. Tối đa 1
-  issue cho mỗi cặp (loại thông báo, version), kể cả sau khi issue cũ đã
-  được đóng tay.
+**Tự động vs thủ công:**
 
-**Tạo token `GITHUB_ISSUE_TOKEN` (`secrets.env`):**
-1. GitHub → Settings → Developer settings → **Fine-grained tokens** →
-   Generate new token.
-2. Resource owner: `tkhieu`. Repository access: **Only select
-   repositories** → chọn đúng `Setup-Hindsight` (không chọn thêm repo nào).
-3. Permissions → Repository permissions → **Issues: Read and write**.
-   Không cấp quyền nào khác.
-4. Generate, dán vào `GITHUB_ISSUE_TOKEN=` trong `secrets.env` trên server
-   (không commit).
-5. Để trống: script vẫn chạy đầy đủ, kể cả tự nâng patch — chỉ riêng bước
-   tạo issue bị bỏ (log `NOTE:`/`WARNING:` thay vào đó).
+- **PATCH** (cùng MAJOR.MINOR): chạy `bin/upgrade.sh --yes --auto-rollback --smoke <ver>`; nếu thành công, commit + push `version.env`, rồi gửi
+  Telegram mức `info`. Các kết quả lỗi có tiêu đề và mức riêng ở bảng dưới.
+- **MINOR/MAJOR**: không tự áp dụng. Gửi `info` kèm URL release và lệnh
+  `bin/upgrade.sh <ver>` để nâng tay.
+- Prerelease/draft/version cũ: bỏ qua. Lỗi tra GitHub release hoặc GHCR:
+  ghi journal, exit khác 0, không gửi thông báo release.
+- Repo dirty, không ở `main`, hoặc `main` lệch `origin/main`: bỏ nâng tự
+  động, gửi `warn`; xem lý do trong journal.
+- Không cài được `ops-notify` hoặc gửi lỗi: nội dung tin được ghi vào
+  journal. Với thông báo release chưa nâng, script exit khác 0 để timer
+  báo lỗi. Nếu đã bắt đầu nâng, lỗi gửi tin không kích hoạt rollback; nếu nâng thành công, exit khác 0 để timer báo
+  lỗi gửi tin. Kiểm journal và gửi lại bằng tay khi cần.
 
-Token này cũng được gửi kèm khi gọi API release của
-`vectorize-io/hindsight` để có rate limit cao hơn (5000/h thay vì 60/h không
-auth) — an toàn vì fine-grained token mặc định có quyền đọc MỌI repo
-public, không chỉ repo chọn ở bước 2.
+**Chống trùng release:** file
+`~/.local/state/hindsight/upgrade-notified` (hoặc `$XDG_STATE_HOME/hindsight/upgrade-notified`)
+chứa từng dòng `<minor|major> <version>`, mode `0600`. Chỉ ghi sau khi `ops-notify` gửi thành công. Xoá dòng tương ứng nếu muốn gửi lại bản đó.
+Các thông báo lỗi/rollback được phép lặp vì mỗi lần chạy là một sự kiện mới.
+`--dry-run` chỉ in nội dung định gửi, không tạo file state hay lock.
 
-**`python3` là bắt buộc.** Mọi JSON (release info, GHCR token, liệt kê/tạo
-issue) đi qua `python3` (`server-setup/bin/lib/json.sh`) — không có
-fallback `sed`/`awk`. `check-upstream.sh` kiểm `command -v python3` ngay
-dòng đầu và `exit 1` rõ ràng nếu thiếu, trước khi chạm vào bất cứ gì khác.
-`python3` vốn đã là dependency bắt buộc của `bin/install-systemd.sh`
-(script đó tự kiểm `curl`/`unzip`/`docker`/`python3` trước khi cài gì), và
-đã được xác nhận có sẵn trên server.
+**`python3` là bắt buộc** để parse JSON release và GHCR. Nếu thiếu,
+`check-upstream.sh` dừng trước khi thực hiện thao tác khác.
 
 **Khoá chạy đơn — DÙNG CHUNG với mọi script khác đụng tới DB/app.**
 `server-setup/.ops.lock` (gitignored) là một khoá `flock` DUY NHẤT, được
@@ -706,7 +661,7 @@ dựa vào systemd:
 | `hs stop`/`hs up -d`/`hs ps` (mọi nơi trong `upgrade.sh`, kể cả stop/recovery/verify) | `HINDSIGHT_HS_TIMEOUT` | 120s — gần như lúc nào cũng tức thì, chỉ đề phòng docker daemon đứng |
 | `bin/hs ready` (nội bộ, chính nó) | `HINDSIGHT_READY_TIMEOUT` | 60s (300s ở bước 7/7 lúc upgrade) — vòng lặp curl bên trong `bin/hs` |
 | `bin/hs ready` (bọc ngoài, chặn hang TRƯỚC khi vòng lặp trên kịp chạy — ví dụ `docker compose port` đứng) | `HINDSIGHT_READY_OUTER_MARGIN` (cộng thêm vào `HINDSIGHT_HS_TIMEOUT`/budget phía trên) | +30s |
-| `bin/smoke.sh` (bước `--smoke` sau khi lên version mới; timeout = smoke FAIL -> auto-rollback + issue) | `HINDSIGHT_SMOKE_TIMEOUT` | 600s — bao cả `hs url` lẫn mọi curl bên trong; quá hạn thì TERM, thêm 30s mà chưa thoát thì KILL |
+| `bin/smoke.sh` (bước `--smoke` sau khi lên version mới; timeout = smoke FAIL -> auto-rollback + tin Telegram) | `HINDSIGHT_SMOKE_TIMEOUT` | 600s — bao cả `hs url` lẫn mọi curl bên trong; quá hạn thì TERM, thêm 30s mà chưa thoát thì KILL |
 | khoá `.ops.lock` (chờ cầm khoá) | `HINDSIGHT_OPS_LOCK_TIMEOUT` | 3600s |
 
 Hết giờ ở bất kỳ bước nào trong số này đều `exit` khác 0 ngay — không bao
@@ -762,21 +717,23 @@ fuser server-setup/.ops.lock 2>/dev/null             # PID nào đang giữ kho�
 pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 ```
 
-**Issue nghĩa là gì:**
+**Tin Telegram nghĩa là gì:**
 
-| Title | Nghĩa |
+| Title / mức | Nghĩa |
 |---|---|
-| `Hindsight auto-upgraded to X.Y.Z` | Patch đã tự nâng xong, smoke test pass, `version.env` đã commit + push. |
-| `Hindsight auto-upgraded to X.Y.Z but version.env commit failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — nhưng `git commit` TRÊN SERVER tự nó lỗi (CHƯA có commit nào, khác với dòng dưới) — thường do thiếu `git config user.name`/`user.email`, hoặc hook `pre-commit`/`commit-msg` chặn. KHÔNG cần rollback — sửa git identity/hook rồi `add` + `commit` + `push` lại từ đầu (lệnh chính xác nằm trong issue). |
-| `Hindsight auto-upgraded to X.Y.Z but version.env push failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — commit `version.env` ĐÃ nằm sẵn ở local trên server (khác với dòng trên — commit đã thành công, chỉ push lỗi), chỉ việc PUSH lên `origin/main` lỗi. KHÔNG cần rollback, và **KHÔNG BAO GIỜ commit lại lần hai** — chỉ `git status`/`git log origin/main..HEAD` rồi `git pull --rebase origin main` (hoặc tự resolve) + `git push origin main` (lệnh chính xác nằm trong issue). |
-| `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` | Patch tự nâng fail SAU khi đã có bản dump pre-upgrade, auto-rollback THÀNH CÔNG và đã được VERIFY (`upgrade.sh` exit `2`) — đã về version cũ, khoẻ; `version.env` KHÔNG đổi, không commit/push. Log tail (đã redact secret) nằm trong issue. |
-| `Hindsight auto-upgrade to X.Y.Z not applied; old version verified running` | Pull ảnh `X.Y.Z` thất bại (mạng, tag chưa publish, hoặc vượt `HINDSIGHT_PULL_TIMEOUT`) — stack KHÔNG bị đụng tới: hindsight chưa từng bị dừng, `version.env` không đổi, không có dump. `upgrade.sh` (exit `2`, `RECOVERY_KIND: untouched`) chỉ VERIFY (version.env + image `:<ver><suffix>` + `/health`) rằng version cũ vẫn chạy khoẻ — không restart gì cả. Tuần sau tự thử lại. |
-| `Hindsight auto-upgrade to X.Y.Z not applied; old version could not be verified — manual action needed` | Như dòng trên (pull fail, stack không bị đụng tới) nhưng VERIFY version cũ lại fail (`upgrade.sh` exit `3`) — hindsight có thể đã có vấn đề từ trước; kiểm `bin/hs ps`/`bin/hs ready`/`bin/hs logs hindsight` tay NGAY. |
-| `Hindsight auto-upgrade to X.Y.Z failed before changing anything (restarted OK)` | Patch tự nâng fail SAU khi pull xong và đã dừng (hoặc thử dừng) hindsight, nhưng TRƯỚC khi `version.env` bị đổi — `hs stop` lỗi/timeout, hoặc chính bước backup pre-upgrade thất bại. Không có gì để rollback, không có dump nào; `upgrade.sh` (exit `2`, `RECOVERY_KIND: restarted`) đã khởi động lại hindsight và VERIFY nó vẫn khoẻ trên version cũ. |
-| `Hindsight auto-upgrade to X.Y.Z failed AND rollback failed — manual action needed` | Patch tự nâng fail SAU khi đã có bản dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`, hoặc bất kỳ code lạ khác) — trạng thái hindsight KHÔNG RÕ, cần làm theo lệnh restore tay trong issue (đường dẫn bản dump pre-upgrade + lệnh §6/§8) NGAY. |
-| `Hindsight auto-upgrade to X.Y.Z failed before changing anything AND the restart could not be verified — manual action needed` | Patch tự nâng fail TRƯỚC khi version.env bị đổi, VÀ việc VERIFY khởi động lại cũng fail (`upgrade.sh` exit `3`, không có dump) — kiểm `bin/hs ps`/`bin/hs up -d`/`bin/hs ready` tay NGAY. |
-| `Hindsight X.Y.Z available (manual upgrade)` | Có bản MINOR/MAJOR mới — xem xét rồi tự chạy `bin/upgrade.sh X.Y.Z` khi sẵn sàng. |
-| `Hindsight X.Y.Z available but auto-upgrade blocked (repo not clean)` | Có patch mới nhưng repo trên server dirty / lệch `origin/main` — dọn repo (`git status`, `git pull`) rồi chạy tay `bin/upgrade.sh X.Y.Z`. |
+| `Hindsight auto-upgraded to X.Y.Z` / info | Patch đã tự nâng xong, smoke test pass, `version.env` đã commit + push. |
+| `Hindsight auto-upgraded to X.Y.Z but version.env commit failed` / warn | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — nhưng `git commit` TRÊN SERVER tự nó lỗi (CHƯA có commit nào, khác với dòng dưới) — thường do thiếu `git config user.name`/`user.email`, hoặc hook `pre-commit`/`commit-msg` chặn. KHÔNG cần rollback — sửa git identity/hook rồi `add` + `commit` + `push` lại từ đầu (lệnh chính xác nằm trong tin Telegram). |
+| `Hindsight auto-upgraded to X.Y.Z but version.env push failed` / warn | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — commit `version.env` ĐÃ nằm sẵn ở local trên server (khác với dòng trên — commit đã thành công, chỉ push lỗi), chỉ việc PUSH lên `origin/main` lỗi. KHÔNG cần rollback, và **KHÔNG BAO GIỜ commit lại lần hai** — chỉ `git status`/`git log origin/main..HEAD` rồi `git pull --rebase origin main` (hoặc tự resolve) + `git push origin main` (lệnh chính xác nằm trong tin Telegram). |
+| `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` / warn | Patch tự nâng fail SAU khi đã có bản dump pre-upgrade, auto-rollback THÀNH CÔNG và đã được VERIFY (`upgrade.sh` exit `2`) — đã về version cũ, khoẻ; `version.env` KHÔNG đổi, không commit/push. Xem kết quả trong journal. |
+| `Hindsight auto-upgrade to X.Y.Z not applied; old version verified running` / warn | Pull ảnh `X.Y.Z` thất bại (mạng, tag chưa publish, hoặc vượt `HINDSIGHT_PULL_TIMEOUT`) — stack KHÔNG bị đụng tới: hindsight chưa từng bị dừng, `version.env` không đổi, không có dump. `upgrade.sh` (exit `2`, `RECOVERY_KIND: untouched`) chỉ VERIFY (version.env + image `:<ver><suffix>` + `/health`) rằng version cũ vẫn chạy khoẻ — không restart gì cả. Tuần sau tự thử lại. |
+| `Hindsight auto-upgrade to X.Y.Z not applied; old version could not be verified — manual action needed` / error | Như dòng trên (pull fail, stack không bị đụng tới) nhưng VERIFY version cũ lại fail (`upgrade.sh` exit `3`) — hindsight có thể đã có vấn đề từ trước; kiểm `bin/hs ps`/`bin/hs ready`/`bin/hs logs hindsight` tay NGAY. |
+| `Hindsight auto-upgrade to X.Y.Z failed before changing anything (restarted OK)` / warn | Patch tự nâng fail SAU khi pull xong và đã dừng (hoặc thử dừng) hindsight, nhưng TRƯỚC khi `version.env` bị đổi — `hs stop` lỗi/timeout, hoặc chính bước backup pre-upgrade thất bại. Không có gì để rollback, không có dump nào; `upgrade.sh` (exit `2`, `RECOVERY_KIND: restarted`) đã khởi động lại hindsight và VERIFY nó vẫn khoẻ trên version cũ. |
+| `Hindsight auto-upgrade to X.Y.Z failed AND rollback failed — manual action needed` / error | Patch tự nâng fail SAU khi đã có bản dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`, hoặc bất kỳ code lạ khác) — trạng thái hindsight KHÔNG RÕ, cần làm theo lệnh restore tay trong tin Telegram (đường dẫn bản dump pre-upgrade + lệnh §6/§8) NGAY. |
+| `Hindsight auto-upgrade to X.Y.Z failed before changing anything AND the restart could not be verified — manual action needed` / error | Patch tự nâng fail TRƯỚC khi version.env bị đổi, VÀ việc VERIFY khởi động lại cũng fail (`upgrade.sh` exit `3`, không có dump) — kiểm `bin/hs ps`/`bin/hs up -d`/`bin/hs ready` tay NGAY. |
+| `Hindsight X.Y.Z available (manual upgrade)` / info | Có bản MINOR/MAJOR mới — xem xét rồi tự chạy `bin/upgrade.sh X.Y.Z` khi sẵn sàng. |
+| `Hindsight X.Y.Z available but auto-upgrade blocked (repo not clean)` / warn | Có patch mới nhưng repo trên server dirty / lệch `origin/main` — dọn repo (`git status`, `git pull`) rồi chạy tay `bin/upgrade.sh X.Y.Z`. |
+
+Unit `hindsight-backup@.service` và `hindsight-upgrade-check.service` gửi Telegram khi thất bại; `hindsight-restore-drill.service` gửi cả khi thành công và thất bại. Backup thành công thường kỳ không gửi tin. Kiểm bằng `systemctl --user cat hindsight-restore-drill.service` rồi chạy drill tay và xem Telegram; lỗi unit xem `journalctl --user -u ops-notify@<unit>`.
 
 ---
 
@@ -799,14 +756,14 @@ pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |
 | Diễn tập restore fail "table missing/empty" | xem §7 "Đọc kết quả thế nào" | |
-| `check-upstream.sh` không tạo issue, chỉ log `NOTE/WARNING` | thiếu `GITHUB_ISSUE_TOKEN` trong `secrets.env` | tạo token theo §8b nếu muốn có issue; patch vẫn tự nâng dù thiếu token |
+| `check-upstream.sh` không gửi Telegram | `ops-notify` chưa cài hoặc gửi lỗi | cài từ Setup-Omnigent RUNBOOK §8, chạy `~/.local/bin/ops-notify --test`, xem `journalctl --user -u hindsight-upgrade-check` |
 | `check-upstream.sh`/`upgrade.sh`/`backup.sh`/`restore-db.sh` báo "could not acquire .ops.lock" | một script khác trong cùng nhóm đang giữ khoá chung (§8b) lâu hơn timeout | `fuser server-setup/.ops.lock`/`pgrep -af 'bin/upgrade.sh\|bin/restore-db.sh'` xem ai đang chạy; đợi xong hoặc tăng `HINDSIGHT_OPS_LOCK_TIMEOUT` |
 | `check-upstream.sh` báo thiếu `python3` ngay dòng đầu | `python3` không có trên `PATH` | cài `python3` (đã là dependency bắt buộc của `bin/install-systemd.sh`) |
-| Patch mới nhưng issue báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
-| Issue báo "...failed AND rollback failed — manual action needed" | upgrade fail sau khi có dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`) | làm theo lệnh restore tay trong issue NGAY (§6/§8), đừng đợi lần chạy tuần sau |
-| Issue báo "...failed before changing anything AND the restart could not be verified" | upgrade fail TRƯỚC khi version.env đổi, và việc VERIFY khởi động lại cũng fail (`upgrade.sh` exit `3`, không có dump) | `bin/hs ps`/`bin/hs up -d`/`bin/hs ready`/`bin/hs logs hindsight` tay NGAY |
-| Issue báo "...but version.env commit failed" | upgrade + smoke pass, nhưng `git commit` trên server tự nó lỗi — CHƯA có commit nào | hindsight đang khoẻ, không cần rollback — kiểm `git config user.name`/`user.email` và hook `pre-commit`/`commit-msg`, rồi `add`+`commit`+`push` lại theo lệnh trong issue |
-| Issue báo "...but version.env push failed" | upgrade + smoke pass, commit đã có sẵn ở local — chỉ PUSH lên `origin/main` lỗi | hindsight đang khoẻ, không cần rollback, **ĐỪNG commit lại** — chỉ `git pull --rebase origin main` rồi `git push origin main` theo lệnh trong issue |
+| Patch mới nhưng tin Telegram báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
+| Tin Telegram báo "...failed AND rollback failed — manual action needed" | upgrade fail sau khi có dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`) | làm theo lệnh restore tay trong tin Telegram NGAY (§6/§8), đừng đợi lần chạy tuần sau |
+| Tin Telegram báo "...failed before changing anything AND the restart could not be verified" | upgrade fail TRƯỚC khi version.env đổi, và việc VERIFY khởi động lại cũng fail (`upgrade.sh` exit `3`, không có dump) | `bin/hs ps`/`bin/hs up -d`/`bin/hs ready`/`bin/hs logs hindsight` tay NGAY |
+| Tin Telegram báo "...but version.env commit failed" | upgrade + smoke pass, nhưng `git commit` trên server tự nó lỗi — CHƯA có commit nào | hindsight đang khoẻ, không cần rollback — kiểm `git config user.name`/`user.email` và hook `pre-commit`/`commit-msg`, rồi `add`+`commit`+`push` lại theo lệnh trong tin Telegram |
+| Tin Telegram báo "...but version.env push failed" | upgrade + smoke pass, commit đã có sẵn ở local — chỉ PUSH lên `origin/main` lỗi | hindsight đang khoẻ, không cần rollback, **ĐỪNG commit lại** — chỉ `git pull --rebase origin main` rồi `git push origin main` theo lệnh trong tin Telegram |
 | Muốn xem compose đã resolve image/port/volume đúng chưa | `hs config` (không flag) in MỌI secret đã resolve ra stdout | chỉ dùng `hs config --services` hoặc `hs config --quiet` (validate, không in secret); hai flag này cố ý là lựa chọn DUY NHẤT được cho phép |
 
 **Đọc log đúng chỗ:**

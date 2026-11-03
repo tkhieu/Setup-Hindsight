@@ -3,6 +3,8 @@
 Description=Hindsight monthly database restore drill
 After=network-online.target docker.service
 Wants=network-online.target
+OnFailure=ops-notify@%N.service
+OnSuccess=ops-notify@%N.service
 
 [Service]
 Type=oneshot
