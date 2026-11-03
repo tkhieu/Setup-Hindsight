@@ -287,6 +287,7 @@ của bạn:
 | `@daily` | 01:05 UTC = 08:05 ICT | 01:05 ICT trực tiếp | `db/daily/` — promote server-side |
 | `@weekly` | CN 01:20 UTC = CN 08:20 ICT | CN 01:20 ICT trực tiếp | `db/weekly/` |
 | `@monthly` | mùng 1, 01:35 UTC = mùng 1, 08:35 ICT | mùng 1, 01:35 ICT trực tiếp | `db/monthly/` |
+| `hindsight-upgrade-check` | CN 02:00 UTC = CN 09:00 ICT | CN 02:00 ICT trực tiếp | không phải backup — kiểm bản mới (§8b) |
 
 Muốn một giờ ICT cụ thể (ví dụ chạy `@daily` đúng 01:05 sáng giờ Việt Nam)
 mà server lại đang set UTC: sửa `OnCalendar=` trong file `.timer` tương ứng
@@ -528,6 +529,86 @@ Sau khi upgrade xong (dù rollback hay thành công): commit + push
 chạy được dù bạn đang ở cwd nào, không chỉ từ `~/hindsight/server-setup` —
 rồi chạy `bin/smoke.sh`.
 
+### 8b. Kiểm tra bản mới hằng tuần (tự động)
+
+```bash
+bin/check-upstream.sh             # chạy tay, giống hệt lịch tự động
+bin/check-upstream.sh --dry-run   # chỉ đọc (release info, GHCR tag) — không upgrade/issue/push
+```
+
+**Tự động vs thủ công — HUMAN DECISION cố định trong script, không có cờ
+nào đổi được:**
+
+- **PATCH** (cùng MAJOR.MINOR, PATCH cao hơn, ví dụ `1.1.0 -> 1.1.1`): tự
+  động chạy `bin/upgrade.sh --yes --auto-rollback --smoke <ver>`; thành
+  công thì tự commit + push `version.env` (deploy key read-write đã cấu
+  hình sẵn trên server, host alias `github-setup-hindsight`) và mở issue.
+- **MINOR/MAJOR**: **không bao giờ** tự áp dụng — chỉ mở issue kèm link
+  release + lệnh chạy tay (`bin/upgrade.sh <ver>`, vẫn hỏi xác nhận như
+  bình thường).
+- Prerelease/draft và version cũ hơn hiện tại: bỏ qua lặng lẽ (`exit 0`,
+  không issue).
+- Lỗi gọi API GitHub (403/5xx) hoặc không thấy tag trên GHCR: log lỗi,
+  `exit 1`, **không** mở issue — tránh spam khi chính bước kiểm tra bị lỗi.
+- Repo trên server dirty, hoặc không đang ở branch `main`, hoặc `main` lệch
+  so với `origin/main` (không fast-forward được): không tự upgrade, mở
+  issue "...auto-upgrade blocked (repo not clean)" thay vào đó.
+- **Chống trùng issue:** mọi issue gắn label `hindsight-upgrade`; trước khi
+  tạo mới, script tìm issue ĐANG OPEN có đúng title (REST API, không phải
+  so gần đúng) — có rồi thì không tạo thêm. Tối đa 1 issue cho mỗi cặp
+  (loại thông báo, version).
+
+**Tạo token `GITHUB_ISSUE_TOKEN` (`secrets.env`):**
+1. GitHub → Settings → Developer settings → **Fine-grained tokens** →
+   Generate new token.
+2. Resource owner: `tkhieu`. Repository access: **Only select
+   repositories** → chọn đúng `Setup-Hindsight` (không chọn thêm repo nào).
+3. Permissions → Repository permissions → **Issues: Read and write**.
+   Không cấp quyền nào khác.
+4. Generate, dán vào `GITHUB_ISSUE_TOKEN=` trong `secrets.env` trên server
+   (không commit).
+5. Để trống: script vẫn chạy đầy đủ, kể cả tự nâng patch — chỉ riêng bước
+   tạo issue bị bỏ (log `NOTE:`/`WARNING:` thay vào đó).
+
+Token này cũng được gửi kèm khi gọi API release của
+`vectorize-io/hindsight` để có rate limit cao hơn (5000/h thay vì 60/h không
+auth) — an toàn vì fine-grained token mặc định có quyền đọc MỌI repo
+public, không chỉ repo chọn ở bước 2.
+
+**Khoá chạy đơn:** script tự cầm `flock` riêng
+(`server-setup/.check-upstream.lock`) — không dùng chung với
+backup/restore-drill vì hai cái đó hiện chưa có khoá nào. Chạy tay khi timer
+đang chạy sẽ thấy `another run is already in progress` và `exit 1` ngay,
+không chờ.
+
+**Auto-rollback hoạt động thế nào (và mất dữ liệu đến đâu):** giống đúng
+quy trình rollback thủ công ở §8 — dừng `hindsight`, trả `version.env` về
+version cũ, `bin/restore-db.sh --yes --no-start` đúng bản dump pre-upgrade,
+`up -d` + chờ `/health` trên version cũ — chỉ khác là làm tự động thay vì
+in lệnh ra cho người chạy tay. **Khoảng mất dữ liệu:** `bin/upgrade.sh` dừng
+`hindsight` TRƯỚC khi lấy bản dump pre-upgrade (§8), nên bản dump đó là
+đúng-y trạng thái cuối của version cũ — chưa mất gì tính đến lúc đó. Chỉ
+những ghi dữ liệu xảy ra SAU khi version mới `up -d` trong CHÍNH lần chạy
+auto-upgrade đó (và trước khi lỗi bị phát hiện) mới mất khi rollback — cửa
+sổ này không tích lũy qua nhiều lần chạy, chỉ tồn tại trong một lần upgrade
+đang thất bại.
+
+**Đọc journal:**
+```bash
+journalctl --user -u hindsight-upgrade-check -n 100 --no-pager
+systemctl --user list-timers hindsight-upgrade-check.timer
+systemctl --user start hindsight-upgrade-check    # chạy ngay, không đợi lịch
+```
+
+**Issue nghĩa là gì:**
+
+| Title | Nghĩa |
+|---|---|
+| `Hindsight auto-upgraded to X.Y.Z` | Patch đã tự nâng xong, smoke test pass, `version.env` đã commit + push. |
+| `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` | Patch tự nâng fail, đã auto-rollback về version cũ; `version.env` KHÔNG đổi, không commit/push. Log tail (đã redact secret) nằm trong issue. |
+| `Hindsight X.Y.Z available (manual upgrade)` | Có bản MINOR/MAJOR mới — xem xét rồi tự chạy `bin/upgrade.sh X.Y.Z` khi sẵn sàng. |
+| `Hindsight X.Y.Z available but auto-upgrade blocked (repo not clean)` | Có patch mới nhưng repo trên server dirty / lệch `origin/main` — dọn repo (`git status`, `git pull`) rồi chạy tay `bin/upgrade.sh X.Y.Z`. |
+
 ---
 
 ## 9. Triệu chứng → nguyên nhân
@@ -549,6 +630,9 @@ rồi chạy `bin/smoke.sh`.
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |
 | Diễn tập restore fail "table missing/empty" | xem §7 "Đọc kết quả thế nào" | |
+| `check-upstream.sh` không tạo issue, chỉ log `NOTE/WARNING` | thiếu `GITHUB_ISSUE_TOKEN` trong `secrets.env` | tạo token theo §8b nếu muốn có issue; patch vẫn tự nâng dù thiếu token |
+| `check-upstream.sh` báo "another run is already in progress" | một lần chạy khác (tay hoặc timer) đang giữ `.check-upstream.lock` | đợi lần đó xong; không phải lỗi |
+| Patch mới nhưng issue báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
 | Muốn xem compose đã resolve image/port/volume đúng chưa | `hs config` (không flag) in MỌI secret đã resolve ra stdout | chỉ dùng `hs config --services` hoặc `hs config --quiet` (validate, không in secret); hai flag này cố ý là lựa chọn DUY NHẤT được cho phép |
 
 **Đọc log đúng chỗ:**

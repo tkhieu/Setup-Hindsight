@@ -1,0 +1,17 @@
+[Unit]
+Description=Hindsight weekly upstream release check
+
+[Timer]
+# No TZ suffix -> this runs on the system's LOCAL time, whatever that is
+# set to (UTC or Asia/Saigon — check `timedatectl`; see docs/PLAYBOOK.md
+# §5/§8b for both interpretations). Sun 02:00 is well clear of the Sun
+# 01:15/01:20 backup timers (Multica/Omnigent/Hindsight) — this never
+# overlaps them, and additionally takes its own flock (bin/check-upstream.sh)
+# so it can never overlap a second run of itself either.
+OnCalendar=Sun *-*-* 02:00:00
+Persistent=true
+RandomizedDelaySec=180
+Unit=hindsight-upgrade-check.service
+
+[Install]
+WantedBy=timers.target

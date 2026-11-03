@@ -1,0 +1,14 @@
+# Installed by bin/install-systemd.sh, which resolves @CONFIG_DIR@.
+[Unit]
+Description=Hindsight weekly upstream release check (auto patch upgrade; issue for minor/major)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@CONFIG_DIR@/bin/check-upstream.sh
+# Covers the patch auto-upgrade path end to end: pull + stop + local backup
+# + best-effort R2 snapshot + up + wait-for-ready (up to 5 min of that is
+# bin/upgrade.sh's own budget) + smoke test, with margin for a cold image
+# pull. See docs/PLAYBOOK.md §8b.
+TimeoutStartSec=1200

@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
-# Safe upgrade. Usage: bin/upgrade.sh 1.2.0
+# Safe upgrade. Usage: bin/upgrade.sh [--yes] [--auto-rollback] [--smoke] 1.2.0
 # (no leading "v" — matches version.env; see its comment on why the
 # published image tag drops the "v" that the upstream git tag has)
+#
+# --yes            skip both confirmation prompts (the commit-diff pause and
+#                   the final "continue?") and never read stdin. For
+#                   scripted callers (bin/check-upstream.sh) — interactive
+#                   behaviour is unchanged when this is omitted.
+# --auto-rollback   on any failure AFTER version.env has been bumped, instead
+#                   of just printing the rollback commands, run them: stop
+#                   hindsight, revert version.env to the old version, restore
+#                   the exact pre-upgrade dump via bin/restore-db.sh --yes
+#                   --no-start, start hindsight back up on the old version
+#                   and verify /health. Exits non-zero either way — the
+#                   upgrade itself still failed, regardless of whether the
+#                   rollback succeeds.
+# --smoke           after /health is ready, also run bin/smoke.sh. A smoke
+#                   failure is treated the same as a failed /health wait
+#                   (triggers --auto-rollback if given).
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -14,7 +30,22 @@ REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
 HS="$CONFIG_DIR/bin/hs"
-NEW="${1:?usage: upgrade.sh <target-version>, e.g. 1.2.0}"
+
+YES=0
+AUTO_ROLLBACK=0
+SMOKE=0
+NEW=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --yes) YES=1 ;;
+    --auto-rollback) AUTO_ROLLBACK=1 ;;
+    --smoke) SMOKE=1 ;;
+    -*) echo "unknown flag: $1" >&2; exit 1 ;;
+    *) NEW="$1" ;;
+  esac
+  shift
+done
+[ -n "$NEW" ] || { echo "usage: upgrade.sh [--yes] [--auto-rollback] [--smoke] <target-version>, e.g. 1.2.0" >&2; exit 1; }
 
 # Guards against a typo/garbage argument being embedded verbatim into sed
 # below (this doubles as the rollback text).
@@ -42,8 +73,10 @@ else
   echo "(gh not available/authenticated — check https://github.com/vectorize-io/hindsight/releases manually)"
 fi
 
-echo
-ask "Diff above OK — continue upgrading $CUR -> $NEW?" || { echo "aborted (nothing changed yet)."; exit 1; }
+if [ "$YES" != 1 ]; then
+  echo
+  ask "Diff above OK — continue upgrading $CUR -> $NEW?" || { echo "aborted (nothing changed yet)."; exit 1; }
+fi
 
 say "2/7 Pull target image ($NEW) before changing anything"
 # Via shell env override (Compose gives shell env precedence over
@@ -84,11 +117,38 @@ the database, and leaves hindsight stopped either way — it will say clearly
 if the restore itself failed, in which case do not proceed to step 4.
 TXT
 }
+# Runs the exact commands print_rollback above only prints, for --auto-rollback.
+# Always returns 0 — any failure inside it is reported but must not mask the
+# original (already non-zero) exit status on_exit is about to propagate.
+do_auto_rollback() {
+  echo "AUTO-ROLLBACK: restoring $CUR from $PRE_DUMP" >&2
+  if ! "$HS" stop hindsight; then
+    echo "WARNING: 'hs stop hindsight' failed during auto-rollback — continuing anyway." >&2
+  fi
+  sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|" "$CONFIG_DIR/version.env"
+  if ! "$CONFIG_DIR/bin/restore-db.sh" --yes --no-start "$PRE_DUMP"; then
+    echo "ERROR: auto-rollback's restore-db.sh failed — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
+    return
+  fi
+  if ! "$HS" up -d; then
+    echo "ERROR: auto-rollback could not start hindsight on $CUR — run manually: $HS up -d" >&2
+    return
+  fi
+  if ! "$HS" ready; then
+    echo "ERROR: hindsight on $CUR did not become ready after auto-rollback — check: $HS logs hindsight" >&2
+    return
+  fi
+  echo "AUTO-ROLLBACK OK — hindsight is back on $CUR and healthy." >&2
+}
 on_exit() {
   local status=$?
   [ "$FAILED" = 1 ] || exit "$status"
   if [ "$VERSION_BUMPED" = 1 ]; then
-    print_rollback
+    if [ "$AUTO_ROLLBACK" = 1 ]; then
+      do_auto_rollback
+    else
+      print_rollback
+    fi
   else
     echo >&2
     echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back." >&2
@@ -146,18 +206,25 @@ if ! HINDSIGHT_READY_TIMEOUT=300 "$HS" ready; then
   exit 1
 fi
 
+if [ "$SMOKE" = 1 ]; then
+  say "7b/7 Smoke test"
+  if ! "$CONFIG_DIR/bin/smoke.sh"; then
+    echo "Smoke test failed after upgrading to $NEW." >&2
+    exit 1
+  fi
+fi
+
 FAILED=0
-cat <<TXT
-
-Upgraded $CUR -> $NEW.
-
-Two things left:
-  1. Commit + push version.env (from any cwd — these use the resolved repo
-     root, $REPO_ROOT, not a path relative to where you happen to be):
-       git -C "$REPO_ROOT" add server-setup/version.env
-       git -C "$REPO_ROOT" commit -m "chore: bump hindsight to $NEW"
-       git -C "$REPO_ROOT" push
-  2. Smoke test: bin/smoke.sh
-
-Pre-upgrade dump kept at: $PRE_DUMP
-TXT
+echo
+echo "Upgraded $CUR -> $NEW."
+echo
+if [ "$YES" != 1 ]; then
+  echo "Commit + push version.env (from any cwd — these use the resolved repo"
+  echo "root, $REPO_ROOT, not a path relative to where you happen to be):"
+  echo "  git -C \"$REPO_ROOT\" add server-setup/version.env"
+  echo "  git -C \"$REPO_ROOT\" commit -m \"chore: bump hindsight to $NEW\""
+  echo "  git -C \"$REPO_ROOT\" push"
+fi
+[ "$SMOKE" = 1 ] || echo "Smoke test: bin/smoke.sh"
+echo
+echo "Pre-upgrade dump kept at: $PRE_DUMP"
