@@ -52,42 +52,16 @@ say "2/7 Pull target image ($NEW) before changing anything"
 # so there is nothing to roll back and no trap is needed above this line.
 HINDSIGHT_VERSION="$NEW" "$HS" pull hindsight
 
-say "3/7 Stopping hindsight (db stays up) so the backup below is final"
-# Taking the backup BEFORE stopping (the previous ordering) leaves a window
-# where writes after the dump but before the stack actually stops are lost
-# if that dump is ever used for a rollback. Stopping first means the dump
-# taken in the next step is provably the exact state the old version left
-# behind — nothing written after it, nothing missing from it.
-"$HS" stop hindsight
-running_services="$("$HS" ps --services --status running)"
-if printf '%s\n' "$running_services" | grep -qx hindsight; then
-  echo "ERROR: hindsight is still running after 'hs stop hindsight' — aborting before touching anything else." >&2
-  exit 1
-fi
-
-say "4/7 Final backup (the only rollback path — migrations are forward-only)"
-if ! backup_out="$("$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"; then
-  echo "ERROR: backup failed — hindsight is stopped, but version.env/image are unchanged." >&2
-  echo "Nothing to roll back; just restart when ready: $HS start hindsight" >&2
-  exit 1
-fi
-echo "$backup_out"
-PRE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
-[ -f "$PRE_DUMP" ] || { echo "couldn't determine the pre-upgrade dump path — aborting before touching anything else." >&2; exit 1; }
-echo "pre-upgrade dump (hindsight was already stopped when this was taken): $PRE_DUMP"
-
-if [ -f "$CONFIG_DIR/secrets.env" ]; then
-  say "4b/7 R2 6h snapshot of that same state (best-effort)"
-  "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped — the local backup above still covers rollback." >&2
-else
-  echo
-  echo "no secrets.env — skipping R2 snapshot (local backup above still covers rollback)."
-fi
-
-# From here on, state changes on disk/in the stack — arm the rollback
-# printer so ANY failure (this script exiting for any reason before the
-# final "success" line) prints exact recovery commands.
+# From here on, stopping the app is itself a state change worth recovering
+# from automatically — arm the trap NOW, before the stop below, not after
+# the backup that follows it. A failure anywhere from here on (stop itself,
+# the backup, or anything after) must not exit silently and leave hindsight
+# down with no guidance. VERSION_BUMPED distinguishes the two recoveries
+# the trap can give: before version.env is touched, the fix is just
+# "start hindsight back up on $CUR" (nothing else changed); after, it's the
+# full dump-restore rollback below.
 FAILED=1
+VERSION_BUMPED=0
 print_rollback() {
   cat >&2 <<TXT
 
@@ -110,11 +84,58 @@ the database, and leaves hindsight stopped either way — it will say clearly
 if the restore itself failed, in which case do not proceed to step 4.
 TXT
 }
-trap '[ "$FAILED" = 1 ] && print_rollback' EXIT
+on_exit() {
+  local status=$?
+  [ "$FAILED" = 1 ] || exit "$status"
+  if [ "$VERSION_BUMPED" = 1 ]; then
+    print_rollback
+  else
+    echo >&2
+    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back." >&2
+    echo "Restarting hindsight on $CUR..." >&2
+    if "$HS" up -d; then
+      echo "hindsight restarted on $CUR." >&2
+    else
+      echo "ERROR: could not restart hindsight automatically — run manually: $HS up -d" >&2
+    fi
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+
+say "3/7 Stopping hindsight (db stays up) so the backup below is final"
+# Taking the backup BEFORE stopping (an earlier version of this script did
+# this) leaves a window where writes after the dump but before the stack
+# actually stops are lost if that dump is ever used for a rollback.
+# Stopping first means the dump taken in the next step is provably the
+# exact state the old version left behind — nothing written after it,
+# nothing missing from it.
+"$HS" stop hindsight
+running_services="$("$HS" ps --services --status running)"
+if printf '%s\n' "$running_services" | grep -qx hindsight; then
+  echo "ERROR: hindsight is still running after 'hs stop hindsight' — aborting before touching anything else." >&2
+  exit 1
+fi
+
+say "4/7 Final backup (the only rollback path — migrations are forward-only)"
+backup_out="$("$CONFIG_DIR/bin/backup.sh" "pre-$NEW")"
+echo "$backup_out"
+PRE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
+[ -f "$PRE_DUMP" ] || { echo "couldn't determine the pre-upgrade dump path — aborting before touching anything else." >&2; exit 1; }
+echo "pre-upgrade dump (hindsight was already stopped when this was taken): $PRE_DUMP"
+
+if [ -f "$CONFIG_DIR/secrets.env" ]; then
+  say "4b/7 R2 6h snapshot of that same state (best-effort)"
+  "$CONFIG_DIR/bin/backup-r2.sh" 6h || echo "R2 backup failed/skipped — the local backup above still covers rollback." >&2
+else
+  echo
+  echo "no secrets.env — skipping R2 snapshot (local backup above still covers rollback)."
+fi
 
 say "5/7 Bump version.env"
 sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$NEW|" "$CONFIG_DIR/version.env"
 grep -E '^HINDSIGHT_VERSION=' "$CONFIG_DIR/version.env"
+VERSION_BUMPED=1
 
 say "6/7 Up"
 "$HS" up -d

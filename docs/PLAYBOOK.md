@@ -119,9 +119,9 @@ phải cấp lại key cho mọi agent/MCP client đang dùng.
 
 1. Cloudflare dashboard → R2 → tạo bucket `hindsight-hieutk-dev-backups`
    (khớp `R2_BUCKET` trong `base.env`; đổi tên thì sửa cả hai).
-2. Lifecycle rule trên bucket đó:
-   - prefix `staging/` → expire sau **1 ngày** (dọn bản dump tạm của mode
-     `6h`, xem chú thích trong `bin/backup-r2.sh`).
+2. Lifecycle rule trên bucket đó (không cần prefix `staging/` — `backup-r2.sh`
+   dump ra file tạm trên đĩa local, validate xong mới upload thẳng vào
+   `db/6h/`, không còn bước trung gian nào trên R2):
    - prefix `db/6h/` → expire sau ví dụ **7 ngày**.
    - prefix `db/daily/` → **30 ngày**, `db/weekly/` → **90 ngày**,
      `db/monthly/` → giữ lâu hơn hoặc vô thời hạn, theo nhu cầu.
@@ -198,15 +198,34 @@ Chỉ cần backup Postgres — attachment Hindsight lưu native trong Postgres
 Tự động qua systemd user timer (`Persistent=true` nên chạy bù lần bị lỡ khi
 máy reboot — vòng lặp sleep trong container không có cơ chế này).
 
-| Timer | Lịch (giờ server, UTC) | Prefix |
-|---|---|---|
-| `@6h` | 00:15 / 06:15 / 12:15 / 18:15 | `db/6h/` — dump thật |
-| `@daily` | 01:05 | `db/daily/` — promote server-side |
-| `@weekly` | CN 01:20 | `db/weekly/` |
-| `@monthly` | mùng 1, 01:35 | `db/monthly/` |
+⚠️ **`OnCalendar=` trong các file `.timer` không có hậu tố timezone, nên
+systemd hiểu nó theo giờ LOCAL của hệ thống** — có thể là UTC hoặc đã là
+Asia/Saigon, tuỳ máy được cài thế nào. Kiểm tra trước khi tin bảng dưới:
 
-(Lệch 5-15 phút so với timer cùng tên của Multica/Omnigent — xem §9 nếu cả
-ba có vẻ chạy cùng lúc mà bạn không ngờ tới.)
+```bash
+timedatectl   # xem dòng "Time zone:"
+```
+
+Bảng dưới ghi theo hai giả định — đọc đúng dòng khớp với output `timedatectl`
+của bạn:
+
+| Timer | Nếu server = UTC (literal = UTC) | Nếu server = Asia/Saigon (literal = ICT) | Prefix |
+|---|---|---|---|
+| `@6h` | 00:15/06:15/12:15/18:15 UTC = 07:15/13:15/19:15/01:15 ICT | 00:15/06:15/12:15/18:15 ICT trực tiếp | `db/6h/` — dump thật |
+| `@daily` | 01:05 UTC = 08:05 ICT | 01:05 ICT trực tiếp | `db/daily/` — promote server-side |
+| `@weekly` | CN 01:20 UTC = CN 08:20 ICT | CN 01:20 ICT trực tiếp | `db/weekly/` |
+| `@monthly` | mùng 1, 01:35 UTC = mùng 1, 08:35 ICT | mùng 1, 01:35 ICT trực tiếp | `db/monthly/` |
+
+Muốn một giờ ICT cụ thể (ví dụ chạy `@daily` đúng 01:05 sáng giờ Việt Nam)
+mà server lại đang set UTC: sửa `OnCalendar=` trong file `.timer` tương ứng
+trừ đi 7 giờ (01:05 ICT = 18:05 UTC hôm trước), rồi `bin/install-systemd.sh`
+lại để cài file đã sửa. `systemd-analyze calendar --iterations=5
+'<OnCalendar của bạn>'` in ra lần chạy kế tiếp theo giờ LOCAL hệ thống —
+dùng nó để xác nhận trước khi tin bất kỳ con số nào ở đây.
+
+(Lệch 5-15 phút so với timer cùng tên của Multica/Omnigent, tính theo cùng
+giờ local của server — xem §9 nếu cả ba có vẻ chạy cùng lúc mà bạn không
+ngờ tới.)
 
 ```bash
 systemctl --user list-timers 'hindsight-backup@*'
@@ -217,6 +236,14 @@ bin/backup-r2.sh 6h                            # chạy tay, xem output trực t
 
 **Script không bao giờ xoá.** Hết hạn do R2 lifecycle rule lo (§4.2), nên
 server bị chiếm cũng không xoá được lịch sử.
+
+**Dump hợp lệ được xác định bằng cấu trúc, không phải kích thước.**
+`bin/backup.sh` và `bin/backup-r2.sh` đều kiểm `gzip -t` + có đúng dòng
+chân trang `-- PostgreSQL database dump complete` của `pg_dump`
+(`bin/lib/dump.sh`) — **không** còn ngưỡng byte tối thiểu. Một DB mới khởi
+tạo, chưa chạy migration nào, dump ra chỉ ~400 byte (đã đo thật) nhưng vẫn
+là dump hợp lệ; ngưỡng byte cũ (2048) từng làm chính bước backup an toàn
+trước khi restore (§6) fail trên đúng server mới cài.
 
 ⚠️ **`RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true` là bắt buộc.** Token R2 scoped
 theo bucket không có quyền `CreateBucket`, mà rclone mặc định gọi nó để
@@ -248,9 +275,12 @@ gì tới DB thật):
    hoặc đang hồi phục sau sự cố mà không có gì đang chạy — không có bước
    này, bước 5 dưới sẽ fail vì không `exec` được vào một container chưa
    tồn tại. Vô hại nếu `db` đã chạy sẵn.
-5. **Backup pre-restore local** — bắt buộc phải thành công, nếu không script
-   dừng tại đây, chưa đụng gì tới DB thật.
-6. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh stop).
+5. `bin/hs stop hindsight`, xác nhận đã dừng thật (không chỉ tin lệnh
+   stop) — làm TRƯỚC bước backup, không phải sau: backup trước rồi mới
+   dừng để lại khoảng hở, ghi dữ liệu giữa hai mốc đó vừa không có trong
+   bản pre-restore vừa mất luôn khi `DROP DATABASE` ở bước 7.
+6. **Backup pre-restore local** — bắt buộc phải thành công, nếu không
+   script dừng tại đây (hindsight đã dừng nhưng DB thật chưa bị đụng gì).
 7. `DROP DATABASE ... WITH (FORCE); CREATE DATABASE ...`
 8. Restore (`psql -1 -f -` — một transaction, lỗi giữa đường thì rollback
    toàn bộ, không để DB ở trạng thái nửa vời).
@@ -262,7 +292,7 @@ gì tới DB thật):
    `upgrade.sh` — image cũ tự lên lại ở bước sau.
 
 Nếu bước 8 fail: hindsight **không** được start lại, script in sẵn lệnh
-restore lại từ bản pre-restore vừa tạo ở bước 5.
+restore lại từ bản pre-restore vừa tạo ở bước 6.
 
 ---
 
@@ -277,21 +307,23 @@ bin/restore-db.sh --drill r2:latest
 Restore vào DB tạm `restoretest_<timestamp>_<pid>` (tên duy nhất mỗi lần
 chạy — không thể trùng và xoá nhầm DB có sẵn), kiểm tra 4 bảng cốt lõi
 (`banks`, `memory_units`, `entities`, `documents`) **tồn tại** (bắt buộc,
-không điều kiện — bắt lỗi schema/dump hỏng), rồi áp số dòng tối thiểu có
-chọn lọc theo schema thật của v1.1.0:
+không điều kiện — bắt lỗi schema/dump hỏng).
 
-- `banks` phải ≥ `HINDSIGHT_DRILL_MIN_ROWS` (mặc định 1) — đây là phép kiểm
-  "có phải backup của instance đã dùng thật không"; set `=0` nếu server mới
-  cài chưa từng tạo bank nào.
-- `memory_units` chỉ bắt buộc > 0 **khi `banks` > 0** — một bank có thể tồn
-  tại hợp lệ mà chưa retain gì (`PUT /v1/default/banks/{id}` tạo bank ngay,
-  memory bằng 0), nhưng có bank mà toàn bộ phần nội dung trống rỗng mới là
-  dấu hiệu dump bị cắt/hỏng.
-- `entities`, `documents` **không** bắt số dòng tối thiểu — entity là sản
-  phẩm của một bước trích xuất riêng trên nội dung đã retain
-  (`models.py: Entity.bank_id`, bảng nối `unit_entities`), nội dung không
-  sinh ra entity nào là bình thường; `memory_units.document_id` cũng không
-  có ràng buộc NOT NULL buộc mọi memory phải thuộc một document.
+Số dòng tối thiểu **chỉ áp dụng cho một bảng duy nhất: `banks`**, qua
+`HINDSIGHT_DRILL_MIN_ROWS` (mặc định `1`) — không có knob nào khác, không
+bảng nào khác bị so với nó:
+
+- `banks` phải ≥ `HINDSIGHT_DRILL_MIN_ROWS` — phép kiểm "có phải backup của
+  instance đã dùng thật không"; set `HINDSIGHT_DRILL_MIN_ROWS=0` nếu server
+  mới cài chưa từng tạo bank nào.
+- `memory_units`, `entities`, `documents` **chỉ cần tồn tại, không bắt số
+  dòng tối thiểu** — cả ba đều hợp lệ khi bằng 0: một bank có thể chưa
+  retain gì (`PUT /v1/default/banks/{id}` tạo bank ngay, memory bằng 0,
+  bình thường, không phải lỗi); entity là sản phẩm của một bước trích xuất
+  riêng trên nội dung đã retain (`models.py: Entity.bank_id`, bảng nối
+  `unit_entities`) — nội dung không sinh ra entity nào là bình thường;
+  `memory_units.document_id` cũng không có ràng buộc NOT NULL buộc mọi
+  memory phải thuộc một document.
 
 Sau đó **luôn xoá** `restoretest_*` dù thành công hay thất bại. **Không bao
 giờ đụng tới DB thật hoặc dừng `hindsight`.**
@@ -327,9 +359,12 @@ systemctl --user start hindsight-restore-drill   # chạy ngay, không đợi l�
   `RCLONE_CONFIG_R2_NO_CHECK_BUCKET` thiếu không.
 - **Thất bại "table ... missing":** schema trong dump không khớp — dump từ
   version cũ hơn trước một migration lớn, hoặc dump bị cắt giữa đường.
-- **Thất bại "row(s) (< N)":** dump trông rỗng — có thể đúng (server mới,
-  chưa ai retain gì — set `HINDSIGHT_DRILL_MIN_ROWS=0` để qua bước này) hoặc
-  sai (backup-r2.sh đang dump nhầm DB/schema).
+- **Thất bại "'banks' has N row(s) (< HINDSIGHT_DRILL_MIN_ROWS)":** dump
+  trông như của một instance chưa ai dùng — có thể đúng (server mới, chưa
+  tạo bank nào — set `HINDSIGHT_DRILL_MIN_ROWS=0` để qua bước này) hoặc sai
+  (backup-r2.sh đang dump nhầm DB/schema). Đây là bảng DUY NHẤT bị so số
+  dòng — `memory_units`/`entities`/`documents` chỉ cần tồn tại, một bank
+  chưa retain gì (0 memory) không bao giờ làm fail bước này.
 - **`--drill-full` báo "bank count mismatch":** có thể chỉ vì có bank mới
   tạo SAU thời điểm dump — chạy lại với `r2:latest` (bản mới nhất) để xác
   nhận; nếu vẫn lệch, nghi ngờ dump bị thiếu dữ liệu.
@@ -357,8 +392,18 @@ xong và lúc app thực sự dừng sẽ mất nếu sau này phải rollback v
 Dừng app rồi mới backup đảm bảo bản dump là đúng-y trạng thái cuối cùng của
 version cũ, không thiếu không dư.
 
-Từ lúc app bị dừng trở đi, bất kỳ lỗi nào (script exit vì bất cứ lý do gì)
-đều in sẵn lệnh rollback đúng thứ tự, nêu rõ tên file dump vừa tạo:
+Trap bắt lỗi được gắn **ngay trước** lệnh dừng `hindsight` — không phải sau
+backup — nên mọi lỗi từ đó trở đi (dừng app fail, backup fail, hay bất cứ
+gì sau đó) đều được xử lý, không exit im lặng bỏ app ở trạng thái dừng mà
+không nói gì:
+
+- **Nếu lỗi xảy ra TRƯỚC khi `version.env` bị đổi** (dừng app fail, backup
+  fail, …): `version.env` vẫn còn version cũ, nên script tự chạy
+  `hs up -d` để khởi động lại `hindsight` trên version cũ — không có gì
+  trong DB cần rollback vì chưa đụng gì tới DB.
+- **Nếu lỗi xảy ra SAU khi `version.env` đã đổi** (lên `up -d`/chờ
+  `/health` fail): in lệnh rollback đúng thứ tự, nêu rõ tên file dump vừa
+  tạo:
 
 ```bash
 bin/hs stop hindsight

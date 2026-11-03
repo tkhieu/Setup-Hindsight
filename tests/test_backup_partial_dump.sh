@@ -14,6 +14,7 @@ mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/backup.sh" "$TMP/bin/backup.sh"
 cp "$SS/bin/backup-r2.sh" "$TMP/bin/backup-r2.sh"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
+cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
 chmod +x "$TMP/bin/backup.sh" "$TMP/bin/backup-r2.sh"
 
 # Fake hs: `exec ... pg_dump` writes a few bytes (simulating a dump that
@@ -31,7 +32,6 @@ chmod +x "$TMP/bin/hs"
 cat > "$TMP/base.env" <<'EOF'
 HINDSIGHT_DB_USER=hindsight_user
 HINDSIGHT_DB_NAME=hindsight_db
-HINDSIGHT_BACKUP_MIN_BYTES=1
 R2_BUCKET=test-bucket
 RCLONE_CONFIG=/dev/null
 RCLONE_CONFIG_R2_TYPE=s3
@@ -60,17 +60,17 @@ if [ -n "$leftover" ]; then
 fi
 
 # ---- bin/backup-r2.sh 6h -----------------------------------------------
+# With the dump-to-local-file-first design, a failed pg_dump means
+# backup-r2.sh never touches rclone AT ALL — not rcat, not copyto,
+# nothing, in any prefix. The log staying completely EMPTY is the
+# assertion, not just "no copyto": there is no longer a staging/ upload
+# step that could legitimately run before the failure is noticed.
 RCLONE_LOG="$TMP/rclone.log"
 : > "$RCLONE_LOG"
 cat > "$TMP/fake-rclone" <<EOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$RCLONE_LOG"
-cmd="\$1"; shift
-case "\$cmd" in
-  rcat) cat >/dev/null; exit 0 ;;
-  size) echo '{"bytes": 999999}'; exit 0 ;;
-  *) exit 0 ;;
-esac
+exit 0
 EOF
 chmod +x "$TMP/fake-rclone"
 export RCLONE_BIN="$TMP/fake-rclone"
@@ -81,8 +81,8 @@ if ./bin/backup-r2.sh 6h </dev/null 2>"$TMP/backup-r2.err"; then
 fi
 cat "$TMP/backup-r2.err"
 
-if grep -q '^copyto' "$RCLONE_LOG"; then
-  echo "backup-r2.sh promoted a failed dump to db/6h/:"
+if [ -s "$RCLONE_LOG" ]; then
+  echo "backup-r2.sh called rclone at all on a failed dump (expected zero calls):"
   cat "$RCLONE_LOG"
   exit 1
 fi

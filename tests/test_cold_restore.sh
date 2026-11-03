@@ -15,6 +15,7 @@ mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/restore-db.sh" "$TMP/bin/restore-db.sh"
 cp "$SS/bin/backup.sh" "$TMP/bin/backup.sh"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
+cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
 chmod +x "$TMP/bin/restore-db.sh" "$TMP/bin/backup.sh"
 
 DB_NAME=hindsight_db
@@ -47,7 +48,28 @@ case "\$1" in
     shift
     case "\$*" in
       *pg_isready*) exit 0 ;;
-      *pg_dump*) echo "-- fake pg_dump output --"; exit 0 ;;
+      *pg_dump*)
+        # A REALISTIC size on purpose — this is exactly the case that
+        # broke when backup.sh gated on a 2048-byte floor: a freshly
+        # initialized, schema-less database (this cold scenario's db was
+        # just created by 'up -d db' above, hindsight has never run
+        # migrations against it) produces a genuinely tiny dump. Measured
+        # against a real pgvector/pg18 container: 720 bytes uncompressed,
+        # ~400 gzipped. The content below mirrors that real dump's shape,
+        # not an artificially-lowered threshold.
+        cat <<'SQL'
+--
+-- PostgreSQL database dump
+--
+
+SET statement_timeout = 0;
+SET client_encoding = 'UTF8';
+
+--
+-- PostgreSQL database dump complete
+--
+SQL
+        exit 0 ;;
     esac
     has_stdin=0
     prev=""
@@ -66,7 +88,6 @@ chmod +x "$TMP/bin/hs"
 cat > "$TMP/base.env" <<EOF
 HINDSIGHT_DB_USER=hindsight_user
 HINDSIGHT_DB_NAME=$DB_NAME
-HINDSIGHT_BACKUP_MIN_BYTES=1
 EOF
 : > "$TMP/secrets.env"
 
@@ -89,6 +110,16 @@ dump_line=$(grep -n 'pg_dump' "$HS_LOG" | head -1 | cut -d: -f1)
 [ -n "$dump_line" ] || { echo "expected a pg_dump call in the hs log:"; cat "$HS_LOG"; exit 1; }
 if [ "$dump_line" -lt "$up_line" ]; then
   echo "pg_dump was called before 'hs up -d db' — ordering is wrong"
+  exit 1
+fi
+
+# And the backup must run AFTER hindsight is stopped, not before — a
+# backup taken while the app is still writable could miss writes made
+# between the dump and the actual stop.
+stop_line=$(grep -n '^stop hindsight$' "$HS_LOG" | head -1 | cut -d: -f1)
+[ -n "$stop_line" ] || { echo "expected a 'stop hindsight' call in the hs log:"; cat "$HS_LOG"; exit 1; }
+if [ "$dump_line" -lt "$stop_line" ]; then
+  echo "pg_dump was called before 'hs stop hindsight' — ordering is wrong"
   exit 1
 fi
 

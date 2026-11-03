@@ -11,6 +11,8 @@ set -euo pipefail
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/dump.sh"
 HS="$CONFIG_DIR/bin/hs"
 BACKUP_DIR="${HINDSIGHT_BACKUP_DIR:-$CONFIG_DIR/backups}"
 LABEL="${1:-manual}"
@@ -23,9 +25,6 @@ set -a
 . "$CONFIG_DIR/base.env"
 set +a
 
-# An empty/truncated dump that still exits 0 is the worst case: it looks
-# like a backup but isn't.
-MIN_BYTES="${HINDSIGHT_BACKUP_MIN_BYTES:-2048}"
 KEEP="${HINDSIGHT_BACKUP_KEEP:-14}"
 DB_USER="${HINDSIGHT_DB_USER:-hindsight_user}"
 DB_NAME="${HINDSIGHT_DB_NAME:-hindsight_db}"
@@ -50,13 +49,10 @@ if ! "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$PARTIAL"; then
   exit 1
 fi
 
-gzip -t "$PARTIAL" || { echo "ERROR: dump is corrupt (gzip -t failed)." >&2; exit 1; }
+assert_valid_pg_dump "$PARTIAL" \
+  || { echo "ERROR: dump is corrupt or truncated (missing the pg_dump completion footer)." >&2; exit 1; }
 
 size=$(stat -c%s "$PARTIAL")
-if [ "$size" -lt "$MIN_BYTES" ]; then
-  echo "ERROR: dump is only $size bytes (< $MIN_BYTES). Treating as failed." >&2
-  exit 1
-fi
 mv -f "$PARTIAL" "${PREFIX}-db.sql.gz"
 echo "    ok, $size bytes"
 

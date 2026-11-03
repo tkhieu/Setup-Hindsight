@@ -18,8 +18,10 @@
 # --no-start    restore but leave hindsight stopped (used by bin/upgrade.sh's
 #               rollback, which starts the OLD image itself afterwards)
 # --drill       restore into a throwaway `restoretest_<ts>_<pid>` database,
-#               assert core Hindsight tables exist with sane row counts, then
-#               always drop it again — never touches the real database or app.
+#               assert core Hindsight tables exist and 'banks' has rows
+#               (HINDSIGHT_DRILL_MIN_ROWS, default 1; others are
+#               existence-only), then always drop it again — never touches
+#               the real database or app.
 # --drill-full  on top of --drill: also boot a temporary hindsight container
 #               against the drill database on a spare 127.0.0.1 port, wait
 #               for /health, and compare its bank count to the live instance's.
@@ -158,29 +160,26 @@ if [ "$DRILL" = 1 ]; then
   #
   # Existence is checked unconditionally for all four — that catches a
   # corrupt dump or a schema mismatch regardless of how much data is in it.
-  #
-  # Non-zero is asserted more narrowly, justified from the v1.1.0 schema:
-  #   - banks: a dump worth protecting with backups should have at least
-  #     one, so this is the real "does this look like a used instance"
-  #     check (override with HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely
-  #     fresh install that has never had a bank created).
-  #   - memory_units: only required non-zero when banks has data — a bank
-  #     can legitimately exist with nothing retained into it yet
-  #     (PUT /v1/default/banks/{id} creates one with zero memories), so
-  #     banks>0 with memory_units=0 is only suspicious, not definitionally
-  #     broken, but banks>0 while the dump otherwise looks totally empty of
-  #     content is exactly the "truncated dump" shape this check exists for.
+  # This is the ONLY check applied to memory_units/entities/documents: all
+  # three are existence-only, never row-count gated, because every one of
+  # them can be legitimately empty on a perfectly healthy dump —
+  #   - memory_units: PUT /v1/default/banks/{id} creates a bank with zero
+  #     memories; PLAYBOOK.md documents this as expected, not broken.
   #   - entities: Entity rows come from a separate extraction step over
   #     memory_units' content (models.py: Entity.bank_id, UnitEntity join
   #     table) — content that yields no identifiable named entities is
-  #     normal, so zero entities does not mean the dump is broken.
+  #     normal.
   #   - documents: MemoryUnit.document_id is nullable with no NOT NULL
-  #     constraint tying every memory unit to a document row, so this
-  #     table being empty does not by itself prove anything is missing
-  #     either.
+  #     constraint tying every memory unit to a document row.
+  #
+  # 'banks' is the one exception, and the ONLY row-count gate in this
+  # check: HINDSIGHT_DRILL_MIN_ROWS (default 1) is the minimum number of
+  # banks a dump must have — the "does this look like a used instance"
+  # check. Set it to 0 for a genuinely fresh install that has never had a
+  # bank created; there is no other knob here, and no other table is ever
+  # compared against it.
   MIN_ROWS="${HINDSIGHT_DRILL_MIN_ROWS:-1}"
   banks_count=0
-  memory_units_count=0
   for table in banks memory_units entities documents; do
     count="$("$HS" exec -T db psql -U "$DB_USER" -d "$DRILL_DB" -tAc "SELECT count(*) FROM $table;" 2>/dev/null | tr -d '[:space:]')"
     if [ -z "$count" ]; then
@@ -188,18 +187,11 @@ if [ "$DRILL" = 1 ]; then
       exit 1
     fi
     echo "    $table: $count rows"
-    case "$table" in
-      banks) banks_count="$count" ;;
-      memory_units) memory_units_count="$count" ;;
-    esac
+    [ "$table" = banks ] && banks_count="$count"
   done
 
   if [ "$banks_count" -lt "$MIN_ROWS" ]; then
-    echo "ERROR: 'banks' has $banks_count row(s) (< $MIN_ROWS) — restored dump looks like an unused instance (override with HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install)" >&2
-    exit 1
-  fi
-  if [ "$banks_count" -gt 0 ] && [ "$memory_units_count" -eq 0 ]; then
-    echo "ERROR: 'banks' has $banks_count bank(s) but 'memory_units' has 0 rows — looks like a truncated/incomplete dump" >&2
+    echo "ERROR: 'banks' has $banks_count row(s) (< HINDSIGHT_DRILL_MIN_ROWS=$MIN_ROWS) — restored dump looks like an unused instance (set HINDSIGHT_DRILL_MIN_ROWS=0 for a genuinely fresh install)" >&2
     exit 1
   fi
 
@@ -285,13 +277,13 @@ done
 "$HS" exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1 \
   || { echo "ERROR: db did not become ready" >&2; exit 1; }
 
-# ---- 5. local backup first — must succeed, or the whole script aborts here -
-say "Local backup (pre-restore) — required before touching anything"
-backup_out="$("$CONFIG_DIR/bin/backup.sh" pre-restore)"
-echo "$backup_out"
-PRE_RESTORE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
-
-# ---- 6. stop hindsight and verify it's actually stopped --------------------
+# ---- 5. stop hindsight and verify it's actually stopped --------------------
+# Stopped BEFORE the backup below, not after: backing up first would leave
+# a window where a write lands after the dump but before the app actually
+# stops — gone for good the moment the next step drops the database, and
+# not in the "pre-restore" dump either. Stopping first makes that dump
+# provably the exact final state, matching the same ordering bin/upgrade.sh
+# uses for its own pre-upgrade backup.
 say "Stopping hindsight"
 "$HS" stop hindsight
 running_services="$("$HS" ps --services --status running)"
@@ -299,6 +291,12 @@ if printf '%s\n' "$running_services" | grep -qx hindsight; then
   echo "ERROR: hindsight is still running after 'hs stop hindsight'" >&2
   exit 1
 fi
+
+# ---- 6. local backup — must succeed, or the whole script aborts here ------
+say "Local backup (pre-restore) — required before touching anything"
+backup_out="$("$CONFIG_DIR/bin/backup.sh" pre-restore)"
+echo "$backup_out"
+PRE_RESTORE_DUMP="$(env_get <(printf '%s\n' "$backup_out") BACKUP_PREFIX)-db.sql.gz"
 
 # ---- 7. recreate the database -----------------------------------------------
 say "Recreating database $DB_NAME"

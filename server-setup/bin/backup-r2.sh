@@ -19,6 +19,8 @@ set -euo pipefail
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 cd "$CONFIG_DIR"
 HS="$CONFIG_DIR/bin/hs"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/dump.sh"
 MODE="${1:?usage: backup-r2.sh 6h|daily|weekly|monthly}"
 
 set -a
@@ -56,43 +58,29 @@ promote() {  # promote <dest-prefix>
 
 case "$MODE" in
   6h)
-    # Dump to a STAGING key outside db/ first, and never promote anything
-    # from staging to db/6h/ (the "final" prefix.sql.gz below) without an
-    # explicit, checked success of the whole pg_dump|gzip|rcat pipeline —
-    # relying on `set -o pipefail` to abort the script via `set -e` alone
-    # would still leave a half-uploaded object sitting in staging/ (not
-    # harmful on its own: r2:latest resolution only ever reads db/<tier>/,
-    # never staging/, and the lifecycle rule expires it in a day — but
-    # "never upload/promote a failed dump" should hold without relying on
-    # that lifecycle rule as the actual safety net).
-    #
-    # Promotion is `rclone copyto` (copy, not move): this script never
-    # deletes anything, including its own staging objects — that would break
-    # the moment R2 Bucket Lock is turned on for db/. The redundant staging
-    # copy is left for an R2 lifecycle rule to expire (docs/PLAYBOOK.md §5:
-    # staging/ -> 1 day).
-    staging="staging/db/$STAMP.sql.gz"
+    # Dump to a LOCAL temp file first and validate it structurally (same
+    # check as bin/backup.sh — gzip -t plus the pg_dump completion footer,
+    # not a byte-size floor: a freshly-initialized, schema-less database
+    # produces a genuinely tiny but complete dump) BEFORE any network
+    # upload — not after, via a staging/ prefix and a round-trip read-back
+    # of its size. On any failure, nothing is uploaded at all: no object of
+    # any kind, in any prefix, not even transiently.
+    tmp="$(mktemp)"
+    # shellcheck disable=SC2064  # $tmp must expand now — it is fixed above
+    trap "rm -f '$tmp'" EXIT
+
     final="db/6h/$STAMP.sql.gz"
-    log "dump -> $staging (staging)"
-    if ! "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" \
-        | gzip \
-        | "$RCLONE" rcat "$DEST/$staging"; then
-      echo "ERROR: pg_dump|gzip|rcat failed — nothing promoted to $final" >&2
+    log "dump -> $tmp (local)"
+    if ! "$HS" exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$tmp"; then
+      echo "ERROR: pg_dump failed — nothing uploaded." >&2
       exit 1
     fi
 
-    # Verify by reading the size back from R2 — catches an empty dump that
-    # would otherwise exit 0.
-    sz="$("$RCLONE" size "$DEST/$staging" --json 2>/dev/null \
-          | python3 -c 'import json,sys; print(json.load(sys.stdin)["bytes"])')"
-    log "staged: $sz bytes"
-    if [ "${sz:-0}" -lt "${HINDSIGHT_BACKUP_MIN_BYTES:-2048}" ]; then
-      echo "ERROR: only $sz bytes, treating as failed (left at $staging for inspection)" >&2
-      exit 1
-    fi
+    assert_valid_pg_dump "$tmp" \
+      || { echo "ERROR: dump is corrupt or truncated (missing the pg_dump completion footer) — nothing uploaded." >&2; exit 1; }
 
-    log "copy $staging -> $final  (server-side)"
-    "$RCLONE" copyto "$DEST/$staging" "$DEST/$final"
+    log "upload $tmp -> $final ($(stat -c%s "$tmp") bytes)"
+    "$RCLONE" copyto "$tmp" "$DEST/$final"
     log "done"
     ;;
 
