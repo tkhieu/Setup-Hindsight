@@ -4,7 +4,7 @@
 # it, then always delete the bank again (success or failure). Payloads
 # verified against the v1.1.0 tag source (hindsight_api/api/http.py:
 # CreateBankRequest, RetainRequest/MemoryItem, RetainResponse,
-# ListMemoryUnitsResponse, RecallRequest).
+# ListMemoryUnitsResponse, RecallRequest/RecallResponse).
 #
 # retain's response (RetainResponse) only reports items_count — the number
 # of items *submitted*, not the number of facts the LLM actually extracted
@@ -13,6 +13,13 @@
 # keeps zero of it. We retain a clearly durable, specific statement instead,
 # and separately confirm >=1 memory unit landed in the bank via
 # GET .../memories/list before trusting recall to find anything.
+#
+# recall's extraction is concise and may paraphrase or drop incidental detail,
+# so we never require a literal substring of the retained sentence to survive
+# into the recall result. This bank was just created and holds nothing else,
+# so any non-empty `results` array from recall against it is already proof
+# recall found the fact just retained; whether a word from the fact (e.g.
+# "Hanoi") literally survived is reported but never required for a pass.
 #
 # Usage: bin/smoke.sh
 set -euo pipefail
@@ -31,7 +38,6 @@ set +a
 
 BASE_URL="$("$HS" url)"
 BANK_ID="smoke-$(date +%s)-$$"
-UNIQ_TOKEN="Smoketest$$x$(date +%s)"
 # Escaped once up front, not per-call: curl's config-file parser treats a
 # bare `"`/`\` in the value as syntax.
 AUTH_HEADER_ESCAPED=$(printf '%s' "$HINDSIGHT_API_TENANT_API_KEY" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -75,8 +81,8 @@ say "1/5 Create bank $BANK_ID"
 req PUT "/v1/default/banks/$BANK_ID" '{}' >/dev/null
 
 say "2/5 Retain a durable fact"
-retain_body=$(cat <<JSON
-{"items": [{"content": "Smoke-test user $UNIQ_TOKEN prefers green tea and lives in Hanoi."}], "async": false}
+retain_body=$(cat <<'JSON'
+{"items": [{"content": "The smoke-test user prefers green tea and lives in Hanoi."}], "async": false}
 JSON
 )
 req POST "/v1/default/banks/$BANK_ID/memories" "$retain_body" >/dev/null
@@ -96,15 +102,25 @@ fi
 echo "memory units in bank: $total"
 
 say "4/5 Recall it"
-recall_body=$(cat <<JSON
-{"query": "What does $UNIQ_TOKEN prefer to drink and where do they live?"}
+recall_body=$(cat <<'JSON'
+{"query": "Where does the smoke-test user live, and what do they prefer to drink?"}
 JSON
 )
 recall_out="$(req POST "/v1/default/banks/$BANK_ID/memories/recall" "$recall_body")"
 echo "$recall_out"
-if ! printf '%s' "$recall_out" | grep -qF "$UNIQ_TOKEN"; then
-  echo "ERROR: recall did not surface the fact just retained (expected to find '$UNIQ_TOKEN')" >&2
+if ! printf '%s' "$recall_out" | grep -q '"results"'; then
+  echo "ERROR: recall response has no 'results' field:" >&2
+  echo "$recall_out" >&2
   exit 1
+fi
+if printf '%s' "$recall_out" | grep -Eq '"results"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]'; then
+  echo "ERROR: recall returned 0 results for a fact just confirmed present in bank $BANK_ID (retain worked, recall and retain disagree)" >&2
+  exit 1
+fi
+if printf '%s' "$recall_out" | grep -qi "hanoi"; then
+  echo "recall result mentions 'Hanoi' (expected content present)"
+else
+  echo "NOTE: recall result did not literally contain 'Hanoi' (non-fatal: recall may paraphrase or condense)"
 fi
 
 say "Smoke test OK"

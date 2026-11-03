@@ -43,9 +43,7 @@ cat >/dev/null
 url=""
 for a in "\$@"; do url="\$a"; done
 case "\$url" in
-  *memories/recall)
-    token=\$(printf '%s' "\$*" | grep -o 'Smoketest[0-9x]*' | head -1)
-    printf '{"results":[{"text":"Smoke-test user %s prefers green tea."}]}\n200\n' "\$token" ;;
+  *memories/recall) printf '{"results":[{"text":"The smoke-test user prefers green tea and lives in Hanoi."}]}\n200\n' ;;
   *memories/list*) printf '{"items":[{"id":"x"}],"total":1,"limit":1,"offset":0}\n200\n' ;;
   *) printf '{}\n200\n' ;;
 esac
