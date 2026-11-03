@@ -99,7 +99,11 @@ header = \"Authorization: Bearer $esc\""
 # Token endpoint first (anonymous pull-scope token, short-lived, not a
 # repo secret — still routed via -K - for consistency), then HEAD-style
 # manifest check (-o /dev/null, we only care about the status code).
-ghcr_tag_exists() {  # ghcr_tag_exists <bare-version, e.g. 1.2.1>
+# Takes the FULL tag compose will actually pull (version + image suffix,
+# e.g. 1.2.1-slim — see image_suffix in bin/lib/env.sh), not the bare
+# version: upstream publishes the slim and full variants separately, so a
+# bare tag existing says nothing about the one this stack runs.
+ghcr_tag_exists() {  # ghcr_tag_exists <tag, e.g. 1.2.1-slim>
   local token status
   token="$(curl -fsS --connect-timeout 10 --max-time 15 \
     "https://ghcr.io/token?scope=repository:vectorize-io/hindsight:pull" | json_str token)"
@@ -291,9 +295,10 @@ case "$cmp" in
     ;;
 esac
 
-say "Confirming GHCR image tag exists: ghcr.io/vectorize-io/hindsight:$ver"
-if ! ghcr_tag_exists "$ver"; then
-  echo "ERROR: ghcr.io/vectorize-io/hindsight:$ver not found via the anonymous pull token — not upgrading or reporting yet (image probably still publishing after the GitHub release)." >&2
+image_tag="${ver}$(image_suffix "$CONFIG_DIR/version.env")"
+say "Confirming GHCR image tag exists: ghcr.io/vectorize-io/hindsight:$image_tag"
+if ! ghcr_tag_exists "$image_tag"; then
+  echo "ERROR: ghcr.io/vectorize-io/hindsight:$image_tag not found via the anonymous pull token — not upgrading or reporting yet (image probably still publishing after the GitHub release)." >&2
   exit 1
 fi
 echo "    ok"
@@ -309,8 +314,9 @@ if [ "$cmp" = patch ]; then
   if [ "$DRY_RUN" = 1 ]; then
     echo "[dry-run] would run: bin/upgrade.sh --yes --auto-rollback --smoke $ver"
     echo "[dry-run] on success: commit+push server-setup/version.env, open issue 'Hindsight auto-upgraded to $ver'"
-    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' or '...failed before changing anything (restarted OK)', depending on whether a pre-upgrade dump was ever taken"
-    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3, or push failing after a healthy upgrade): open the matching '...manual action needed' or '...push failed' issue instead"
+    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' (pre-upgrade dump taken), '...failed before changing anything (restarted OK)' (stopped, no dump), or '...not applied; old version verified running' (image pull failed, stack untouched)"
+    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3): open the matching '...manual action needed' issue instead (rollback failed / restart not verified / untouched old version not verified)"
+    echo "[dry-run] after a healthy upgrade: if git commit fails, open 'Hindsight auto-upgraded to $ver but version.env commit failed'; if only the push fails, open '...but version.env push failed'"
     exit 0
   fi
 
