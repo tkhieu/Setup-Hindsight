@@ -49,6 +49,8 @@ services:
   hindsight:
     image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}${HINDSIGHT_IMAGE_SUFFIX--slim}
     restart: unless-stopped
+    # Upstream 1.2.0 drains in-flight work for ~45s on SIGTERM; allow 75s.
+    stop_grace_period: 75s
     depends_on:
       db:
         condition: service_healthy
