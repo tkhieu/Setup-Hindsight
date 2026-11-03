@@ -40,16 +40,20 @@ Lệnh dưới kéo key qua SSH và ghi thẳng vào file (quyền `600`), khôn
 và không đưa key vào tham số dòng lệnh:
 
 ```bash
-install -d -m 700 ~/.config/hindsight
-( umask 077
-  touch ~/.config/hindsight/client.env && chmod 600 ~/.config/hindsight/client.env
+install -d -m 700 ~/.config/hindsight && (
+  set -e; umask 077
+  F=~/.config/hindsight/client.env
+  touch "$F"; chmod 600 "$F"
+  [ "$(stat -c %a "$F" 2>/dev/null || stat -f %Lp "$F")" = 600 ]   # dừng nếu không đặt được quyền 600
   K=$(ssh hieu@100.77.187.94 "grep '^HINDSIGHT_API_TENANT_API_KEY=' ~/hindsight/server-setup/secrets.env | cut -d= -f2-")
-  printf 'HINDSIGHT_URL=https://hindsight-api.hieutk.dev\nHINDSIGHT_API_KEY=%s\n' "$K" > ~/.config/hindsight/client.env
+  [ -n "$K" ]
+  printf 'HINDSIGHT_URL=https://hindsight-api.hieutk.dev\nHINDSIGHT_API_KEY=%s\n' "$K" > "$F"
   unset K )
 grep -c '^HINDSIGHT_API_KEY=.' ~/.config/hindsight/client.env   # phải in ra 1
 ```
 
-Lệnh này ghi đè `client.env` nếu file đã có, và đặt quyền `600` trước khi ghi key (kể cả khi file cũ đang mở rộng hơn). Biến môi trường `HINDSIGHT_URL`,
+Lệnh này ghi đè `client.env` nếu file đã có, đặt quyền `600` trước khi ghi key (kể cả khi file cũ đang mở rộng hơn), và dừng
+lại không ghi gì nếu không đặt được quyền hoặc không lấy được key. Biến môi trường `HINDSIGHT_URL`,
 `HINDSIGHT_API_KEY`, `HINDSIGHT_BANK` (nếu đặt) ghi đè giá trị trong file.
 
 **Bank:** mặc định `user-<tên đăng nhập>`, Claude Code và Codex dùng chung. Muốn
@@ -88,6 +92,6 @@ Gỡ: `workstation/bin/hindsight-client-setup --uninstall` (giữ lại `client.
 |---|---|
 | Cảnh báo `Codex hooks chưa bật` | Thêm `[features]` và `hooks = true` vào `~/.codex/config.toml`, mở phiên Codex mới |
 | `401` | Key sai, hoặc dùng nhầm `HINDSIGHT_CP_ACCESS_KEY`. Làm lại bước 2 |
-| Không kết nối / `/health` lỗi | Tunnel hoặc stack trên server đang lỗi — xem PLAYBOOK, mục triệu chứng |
+| Không kết nối / `/health` lỗi | DNS trên máy dev (thử `resolvectl flush-caches`), Cloudflare Tunnel, hoặc stack trên server — xem PLAYBOOK, mục triệu chứng |
 | Không thấy memory | `HINDSIGHT_BANK` khác nhau giữa các máy; bank chỉ xuất hiện sau khi đã có dữ liệu |
 | MCP hoặc hook thiếu | Chạy lại `install`; kiểm tra `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/config.toml` |
