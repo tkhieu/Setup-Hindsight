@@ -30,7 +30,7 @@ xem `workstation/` (đang làm ở PR khác trong cùng repo) — không lặp l
 | `cloudflared-hindsight` | server, systemd **user** service, binary host (không phải trong Docker) | không cần sudo, có linger |
 | Config | `~/hindsight/server-setup` (git) | = thư mục này |
 | Repo | `github.com/tkhieu/Setup-Hindsight` (private) | |
-| Dữ liệu persistent | volume `pgdata` (Postgres), volume `hf_cache` (model embedding/reranker local) | attachment lưu native trong Postgres (BYTEA) — không có volume uploads riêng |
+| Dữ liệu persistent | volume `pgdata` (Postgres), `hf_cache` (model local), `chatgpt_credentials` (OAuth) | attachment lưu native trong Postgres (BYTEA) |
 
 **Vì sao không cần checkout upstream riêng:** Hindsight không có file
 `docker-compose.yaml` cần sửa tại chỗ như Multica/Omnigent — `compose.yaml`
@@ -39,8 +39,9 @@ thức của Vectorize (đã đối chiếu với source tag `v1.1.0`), cộng t
 bind `127.0.0.1`, bật xác thực API key, volume cache model, log rotation,
 healthcheck.
 
-**LLM provider:** OpenAI (`HINDSIGHT_API_LLM_PROVIDER=openai`,
-`HINDSIGHT_API_LLM_API_KEY` trong `secrets.env`). Embedding + reranker vẫn
+**LLM provider:** `chatgpt` mặc định, dùng gói ChatGPT Pro qua OAuth, không
+cần OpenAI API key. Model mặc định `gpt-6-luna`. Có thể đổi về `openai` bằng
+một dòng trong `base.env` và key trong `secrets.env` (§4.2). Embedding + reranker vẫn
 dùng model local mặc định của Hindsight (`bge-small-en-v1.5` +
 `ms-marco-MiniLM-L-6-v2`, đã nướng sẵn trong image) — đó là lý do có volume
 `hf_cache`: không có nó, mỗi lần tạo lại container sẽ tải lại model.
@@ -102,20 +103,50 @@ bin/bootstrap.sh
 
 `bootstrap.sh` tự sinh `HINDSIGHT_DB_PASSWORD`, `HINDSIGHT_API_TENANT_API_KEY`,
 `HINDSIGHT_CP_ACCESS_KEY` (bằng `openssl rand -hex 32`) vào `secrets.env`
-(chmod 600), rồi dừng lại nếu `HINDSIGHT_API_LLM_API_KEY` (key OpenAI) còn
-trống:
+(chmod 600). Lần đầu với `chatgpt`, `bootstrap.sh`
+nhắc cài credential và dừng trước khi khởi động API. Làm §4.2 rồi chạy lại
+`bin/bootstrap.sh` (giữ nguyên secret đã sinh).
 
-```bash
-vim secrets.env     # điền HINDSIGHT_API_LLM_API_KEY
-bin/bootstrap.sh    # chạy lại — secret đã sinh được giữ nguyên
-```
-
-Chạy xong, `bootstrap.sh` tự `pull` + `up -d` + chờ `/health`, và in ra API
-key + UI password vừa sinh. **Backup `secrets.env` ra ngoài server ngay**
+Chạy xong, `bootstrap.sh` tự `pull` + `up -d` + chờ `/health`. API key và
+UI password nằm trong `secrets.env`; script không in giá trị. **Backup
+`secrets.env` ra ngoài server ngay**
 (password manager / máy khác) — mất `HINDSIGHT_API_TENANT_API_KEY` nghĩa là
 phải cấp lại key cho mọi agent/MCP client đang dùng.
 
-### 4.2 Bucket R2 + lifecycle rule + token scoped
+### 4.2 Đăng nhập ChatGPT trên máy dev
+
+Không cài Python package toàn hệ thống. Máy dev có `uvx`; ép Python 3.11
+vì dependency ONNX của v1.1.0 chưa hỗ trợ Python 3.15:
+
+```bash
+uvx --python 3.11 --from hindsight-api-slim==1.1.0 hindsight-admin chatgpt login
+uvx --python 3.11 --from hindsight-api-slim==1.1.0 hindsight-admin chatgpt status
+```
+
+Browser quay về `http://127.0.0.1:1455/auth/callback` **trên máy dev**.
+Đồng ý quyền dùng ChatGPT plan. Nếu từ chối, chạy lại `login
+--enable-plan-usage`. File `~/.hindsight/chatgpt/credentials.json` được ghi
+mode 0600. Chuyển qua stdin từ máy dev, không lưu file trung gian trên host
+server (script dùng container chạy một lần để cài credential):
+
+```bash
+ssh hieu@100.77.187.94 '~/hindsight/server-setup/bin/chatgpt-login.sh' < ~/.hindsight/chatgpt/credentials.json
+ssh hieu@100.77.187.94 '~/hindsight/server-setup/bin/chatgpt-login.sh --status'
+uvx --python 3.11 --from hindsight-api-slim==1.1.0 hindsight-admin chatgpt logout --local-only
+```
+
+**Chỉ dùng `logout --local-only` trên máy dev.** `logout` thường thu hồi
+session trên server. Token refresh xoay vòng nên sau khi chuyển, chỉ server
+được dùng bản credential này. Volume `chatgpt_credentials` phải ghi được;
+`chatgpt-volume-init` cấp quyền UID 1000 của image. Chạy lại
+`bin/bootstrap.sh` để xác nhận status và `/health`.
+
+Đổi sang OpenAI API key: sửa **chỉ** `HINDSIGHT_API_LLM_PROVIDER=openai`
+trong `base.env`, điền `HINDSIGHT_API_LLM_API_KEY` trong `secrets.env`, rồi
+`bin/hs up -d`. Quay lại ChatGPT: đổi dòng đó thành `chatgpt`, chạy
+`bin/hs up -d`; nếu volume mất, đăng nhập và chuyển lại như trên.
+
+### 4.3 Bucket R2 + lifecycle rule + token scoped
 
 1. Cloudflare dashboard → R2 → tạo bucket `hindsight-hieutk-dev-backups`
    (khớp `R2_BUCKET` trong `base.env`; đổi tên thì sửa cả hai).
@@ -130,7 +161,7 @@ phải cấp lại key cho mọi agent/MCP client đang dùng.
 4. Điền vào `secrets.env`: `RCLONE_CONFIG_R2_ENDPOINT`,
    `RCLONE_CONFIG_R2_ACCESS_KEY_ID`, `RCLONE_CONFIG_R2_SECRET_ACCESS_KEY`.
 
-### 4.3 Cài rclone + systemd timer + cloudflared
+### 4.4 Cài rclone + systemd timer + cloudflared
 
 ```bash
 bin/install-systemd.sh --dry-run   # xem trước, không đụng gì
@@ -172,7 +203,7 @@ systemctl --user status cloudflared-hindsight
 Đặt Cloudflare Access trước `hindsight.hieutk.dev` (Zero Trust → Access →
 Applications → Self-hosted) — xem §2.
 
-### 4.4 Kiểm tra
+### 4.5 Kiểm tra
 
 ```bash
 bin/hs ready
@@ -192,6 +223,8 @@ Chỉ cần backup Postgres — attachment Hindsight lưu native trong Postgres
 (`BYTEA`, xác nhận trong `hindsight_api/config.py`:
 `DEFAULT_FILE_STORAGE_TYPE = "native"`), không có volume uploads riêng. Volume
 `hf_cache` chỉ chứa model weight tải lại được, không backup.
+Volume `chatgpt_credentials` **không backup lên R2** vì backup R2 hiện không
+mã hóa. Mất server thì đăng nhập ChatGPT và chuyển credential lại (§4.2).
 
 ### Backup lên R2
 
@@ -234,7 +267,7 @@ systemctl --user start hindsight-backup@6h     # chạy ngay
 bin/backup-r2.sh 6h                            # chạy tay, xem output trực tiếp
 ```
 
-**Script không bao giờ xoá.** Hết hạn do R2 lifecycle rule lo (§4.2), nên
+**Script không bao giờ xoá.** Hết hạn do R2 lifecycle rule lo (§4.3), nên
 server bị chiếm cũng không xoá được lịch sử.
 
 **Dump hợp lệ được xác định bằng cấu trúc, không phải kích thước.**
@@ -464,8 +497,11 @@ rồi chạy `bin/smoke.sh`.
 |---|---|---|
 | Đổi env mà không có tác dụng | dùng `restart` thay vì `up -d` | `bin/hs up -d` |
 | `bin/hs ready` fail ngay sau `up -d` | container cần vài giây để migration chạy xong | mặc định chờ tới 60s; `HINDSIGHT_READY_TIMEOUT=180 bin/hs ready` nếu cần lâu hơn |
-| `hs up` báo thiếu secret và dừng | `secrets.env` thiếu file, hoặc `HINDSIGHT_API_TENANT_API_KEY`/`HINDSIGHT_API_LLM_API_KEY`/`HINDSIGHT_CP_ACCESS_KEY` còn trống | `bin/bootstrap.sh` (idempotent, không đụng secret đã có) |
-| Retain/recall trả lỗi LLM | `HINDSIGHT_API_LLM_API_KEY` sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
+| `hs up` báo thiếu secret và dừng | `secrets.env` thiếu file, tenant/UI key trống, hoặc provider API-key thiếu `HINDSIGHT_API_LLM_API_KEY` | `bin/bootstrap.sh` (idempotent); với OpenAI điền key |
+| `hs up` báo ChatGPT credentials thiếu | chưa chuyển credential hoặc plan scope chưa được cấp | làm lại §4.2; kiểm `bin/chatgpt-login.sh --status` |
+| Retain/recall báo refresh token invalid | session ChatGPT hết hiệu lực | đăng nhập lại trên máy dev, chuyển lại bằng `bin/chatgpt-login.sh`, sau đó `logout --local-only` trên máy dev |
+| Retain/recall bị trì hoãn khi hết hạn mức Pro | ChatGPT plan đã hết usage trong chu kỳ | xem ChatGPT Settings → Usage; Hindsight hoãn retain/consolidation rồi thử lại sau 30 phút |
+| Retain/recall lỗi với provider OpenAI | API key sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
 | UI load được nhưng gọi API lỗi 401 | `HINDSIGHT_CP_DATAPLANE_API_KEY` lệch `HINDSIGHT_API_TENANT_API_KEY` | hai biến này PHẢI giống nhau trong `compose.yaml` (đã set cứng — nếu bạn tự sửa compose, đừng tách ra) |
 | Container tạo lại xong, retain đầu tiên chậm hẳn | volume `hf_cache` bị xoá/mount sai, model tải lại từ HuggingFace | `docker volume inspect server-setup_hf_cache`; đừng `docker volume rm` volume này khi không cố ý |
 | Cùng lúc 3 app backup, máy chậm hẳn lúc 01:00-01:35 (giờ local server, xem §5) | Multica/Omnigent/Hindsight timer gần giờ nhau (đã lệch 5-15 phút có chủ đích, nhưng `RandomizedDelaySec` vẫn có thể trùng ngẫu nhiên) | `systemctl --user list-timers` xem giờ chạy thật; không phải lỗi, chỉ là trùng xác suất thấp |

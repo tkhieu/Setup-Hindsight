@@ -27,18 +27,22 @@ else
   cp "$CONFIG_DIR/secrets.env.example" "$CONFIG_DIR/secrets.env"
   chmod 600 "$CONFIG_DIR/secrets.env"
   for k in HINDSIGHT_DB_PASSWORD HINDSIGHT_API_TENANT_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-    sed -i "s|^${k}=\$|${k}=$(openssl rand -hex 32)|" "$CONFIG_DIR/secrets.env"
+    # Keep generated values in the file stream, never in sed's argv.
+    sed -i "/^${k}=\$/d" "$CONFIG_DIR/secrets.env"
+    printf '%s=' "$k" >> "$CONFIG_DIR/secrets.env"
+    openssl rand -hex 32 >> "$CONFIG_DIR/secrets.env"
   done
   echo "generated HINDSIGHT_DB_PASSWORD, HINDSIGHT_API_TENANT_API_KEY, HINDSIGHT_CP_ACCESS_KEY -> secrets.env (chmod 600)"
-  echo "still blank, must be filled by hand: HINDSIGHT_API_LLM_API_KEY (OpenAI), RCLONE_CONFIG_R2_* (R2), CLOUDFLARED_CREDENTIALS_FILE (path, see cloudflared/)."
+  echo "OpenAI key is needed only if provider=openai. Fill RCLONE_CONFIG_R2_* and CLOUDFLARED_CREDENTIALS_FILE before enabling backup/tunnel."
 fi
 
+provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
 llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
-if [ -z "$llm_key" ]; then
+if [ "$provider" != chatgpt ] && [ -z "$llm_key" ]; then
   cat <<TXT
 
-Chưa chạy được: HINDSIGHT_API_LLM_API_KEY còn trống trong secrets.env.
-  1. vim $CONFIG_DIR/secrets.env    # điền OpenAI key vào HINDSIGHT_API_LLM_API_KEY
+Chưa chạy được: HINDSIGHT_API_LLM_API_KEY còn trống trong secrets.env (provider ${provider:-openai}).
+  1. vim $CONFIG_DIR/secrets.env    # điền API key vào HINDSIGHT_API_LLM_API_KEY
   2. bin/bootstrap.sh               # chạy lại — các secret đã sinh được giữ nguyên
 
 R2 (RCLONE_CONFIG_R2_*) và CLOUDFLARED_CREDENTIALS_FILE không bắt buộc để
@@ -52,13 +56,16 @@ say "Pulling images"
 "$HS" pull
 
 say "Starting"
-"$HS" up -d
+if ! "$HS" up -d; then
+  if [ "$provider" = chatgpt ]; then
+    echo "Cài ChatGPT credential bằng bin/chatgpt-login.sh theo docs/PLAYBOOK.md §4, rồi chạy lại bin/bootstrap.sh." >&2
+  fi
+  exit 1
+fi
 
 say "Waiting for /health"
 "$HS" ready
 
-api_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY)"
-cp_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY)"
 cat <<TXT
 
 Xong. Bước tiếp theo:
@@ -66,10 +73,7 @@ Xong. Bước tiếp theo:
   1. Backup secrets.env ra ngoài server (password manager / máy khác).
   2. Từ máy dev, mở tunnel để thử:
        ssh -L 8888:127.0.0.1:8888 -L 9999:127.0.0.1:9999 hieu@100.77.187.94
-     API key (agents/MCP, header Authorization: Bearer <key>):
-       $api_key
-     UI login (http://localhost:9999):
-       $cp_key
+     API key (agents/MCP) và UI login nằm trong secrets.env.
   3. Smoke test: bin/smoke.sh
   4. Cấu hình R2 + cloudflared + systemd timer: docs/PLAYBOOK.md §4.
 TXT

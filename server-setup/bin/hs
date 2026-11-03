@@ -35,19 +35,32 @@ check_secrets() {
   api_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_TENANT_API_KEY)"
   if [ -z "$api_key" ]; then
     echo "hs: HINDSIGHT_API_TENANT_API_KEY is empty in secrets.env — refusing to start unauthenticated." >&2
-    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_API_LLM_API_KEY and HINDSIGHT_CP_ACCESS_KEY)." >&2
+    echo "hs: run 'openssl rand -hex 32' and fill it in (also fill HINDSIGHT_CP_ACCESS_KEY)." >&2
     exit 1
   fi
-  local llm_key
-  llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
-  if [ -z "$llm_key" ]; then
-    echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set your OpenAI key first." >&2
-    exit 1
+  local provider llm_key
+  provider="$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)"
+  if [ "$provider" != chatgpt ]; then
+    llm_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_API_LLM_API_KEY)"
+    if [ -z "$llm_key" ]; then
+      echo "hs: HINDSIGHT_API_LLM_API_KEY is empty in secrets.env — set the API key for provider ${provider:-openai} first." >&2
+      exit 1
+    fi
   fi
   local cp_key
   cp_key="$(env_get "$CONFIG_DIR/secrets.env" HINDSIGHT_CP_ACCESS_KEY)"
   if [ -z "$cp_key" ]; then
     echo "hs: HINDSIGHT_CP_ACCESS_KEY is empty in secrets.env — set a UI login password first." >&2
+    exit 1
+  fi
+}
+
+check_chatgpt_status() {
+  local status
+  if ! status="$(compose run --rm -T --no-deps hindsight hindsight-admin chatgpt status 2>/dev/null)" \
+    || ! printf '%s\n' "$status" | grep -qx 'Signed in: yes' \
+    || ! printf '%s\n' "$status" | grep -qx 'Plan usage enabled: yes'; then
+    echo "hs: ChatGPT credentials are missing or inactive. Sign in on your laptop, then transfer them with bin/chatgpt-login.sh (docs/PLAYBOOK.md §4)." >&2
     exit 1
   fi
 }
@@ -112,6 +125,10 @@ case "${1:-}" in
     ;;
   up|start|run|create)
     check_secrets
+    if [ "$(env_get "$CONFIG_DIR/base.env" HINDSIGHT_API_LLM_PROVIDER)" = chatgpt ]; then
+      compose up -d chatgpt-volume-init
+      check_chatgpt_status
+    fi
     compose "$@"
     ;;
   *)

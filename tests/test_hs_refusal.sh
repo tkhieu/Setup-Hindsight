@@ -13,9 +13,7 @@ mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/hs" "$TMP/bin/hs"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
 chmod +x "$TMP/bin/hs"
-# base.env/version.env aren't read by the `up` refusal path at all (it
-# fails before ever calling docker compose) — not created on purpose, to
-# prove docker is never reached.
+printf 'HINDSIGHT_API_LLM_PROVIDER=openai\n' > "$TMP/base.env"
 
 # case 1: secrets.env missing entirely
 if "$TMP/bin/hs" up </dev/null >"$TMP/out1" 2>"$TMP/err1"; then
