@@ -75,7 +75,7 @@ READY_OUTER_MARGIN="${HINDSIGHT_READY_OUTER_MARGIN:-30}"
 # Whole bin/smoke.sh run (--smoke): create bank + LLM-backed retain + recall
 # + cleanup. Its own curl calls carry --max-time 30 each, but `hs url`
 # (docker compose port) does not, and the total is unbounded without this.
-# A smoke timeout is a smoke FAILURE (-> auto-rollback path + issue).
+# A smoke timeout is a smoke FAILURE (-> auto-rollback path + ops-notify notification).
 SMOKE_TIMEOUT="${HINDSIGHT_SMOKE_TIMEOUT:-600}"
 
 YES=0
@@ -265,7 +265,7 @@ on_exit() {
     # up) — unlike a pull failure below, there is something real to
     # restart here. RECOVERY_KIND is a machine-readable marker (not prose
     # that could get reworded) bin/check-upstream.sh greps for in the log
-    # to pick the right issue title/body — never both "RECOVERY_KIND:" and
+    # to pick the right notification title/body — never both "RECOVERY_KIND:" and
     # the other branch's marker will appear in the same run.
     echo "RECOVERY_KIND: restarted" >&2
     echo >&2
