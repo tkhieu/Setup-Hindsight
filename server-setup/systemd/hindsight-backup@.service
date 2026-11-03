@@ -1,0 +1,14 @@
+# Templated: %i is the mode (6h / daily / weekly / monthly).
+# Installed into ~/.config/systemd/user/ by bin/install-systemd.sh, which
+# resolves @CONFIG_DIR@ to this repo's server-setup/ path on the server.
+[Unit]
+Description=Hindsight backup to R2 (%i)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@CONFIG_DIR@/bin/backup-r2.sh %i
+# A failed backup must never touch the running service — report to the
+# journal only.
+TimeoutStartSec=1800

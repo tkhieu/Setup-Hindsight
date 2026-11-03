@@ -1,0 +1,11 @@
+[Unit]
+Description=Hindsight DB: promote to weekly
+
+[Timer]
+# Offset 5 min from Multica's/Omnigent's weekly promote (both Sun 01:15:00).
+OnCalendar=Sun *-*-* 01:20:00
+Persistent=true
+Unit=hindsight-backup@weekly.service
+
+[Install]
+WantedBy=timers.target

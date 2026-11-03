@@ -1,0 +1,26 @@
+# systemd USER service — no sudo needed. Installed into
+# ~/.config/systemd/user/ by bin/install-systemd.sh.
+# Requires: loginctl enable-linger <user>  (install-systemd.sh checks this)
+#
+# Points at ~/.cloudflared/hindsight-config.yml on the host, not at this
+# repo checkout — that file contains the real tunnel UUID + credentials
+# path and is deliberately kept outside git (see cloudflared/config.yml's
+# header comment).
+#
+# --no-autoupdate: the version is pinned on purpose, same reasoning as
+# Multica's cloudflared-multica.service — an unplanned self-update should
+# not be how this tunnel changes behavior.
+
+[Unit]
+Description=Cloudflare Tunnel (hindsight)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config %h/.cloudflared/hindsight-config.yml tunnel run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

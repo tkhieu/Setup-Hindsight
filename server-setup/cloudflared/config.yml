@@ -1,0 +1,32 @@
+# Cloudflare Tunnel for Hindsight. Deploy to ~/.cloudflared/hindsight-config.yml
+# (bin/install-systemd.sh copies this template there on first run, without
+# overwriting an existing copy — fill in the two REPLACE_ markers below
+# after creating the tunnel; see docs/PLAYBOOK.md §4).
+#
+# Dedicated tunnel, separate from Multica's (~/.cloudflared/config.yml) and
+# Omnigent's (its own docker-managed tunnel) — a config mistake here can't
+# break either of those or vice versa.
+#
+# cloudflared connects out to Cloudflare (outbound only), so the server
+# opens no inbound port for this. It dials in to 127.0.0.1 — matching
+# compose.yaml's own 127.0.0.1-only binds, so compose.yaml needs no changes
+# for this to work.
+
+tunnel: REPLACE_WITH_HINDSIGHT_TUNNEL_UUID
+credentials-file: /home/hieu/.cloudflared/REPLACE_WITH_HINDSIGHT_TUNNEL_UUID.json
+
+ingress:
+  # Agents/MCP clients. Protected by HINDSIGHT_API_TENANT_API_KEY — nothing
+  # else gates this hostname, so losing that key is the same as losing the
+  # tunnel's access control for it.
+  - hostname: hindsight-api.hieutk.dev
+    service: http://127.0.0.1:8888
+
+  # Browser UI. Gated by HINDSIGHT_CP_ACCESS_KEY (the control plane's own
+  # login), but put Cloudflare Access in front of this hostname too
+  # (docs/PLAYBOOK.md §2) — the access key alone is not meant to be the
+  # only thing standing between the UI and the internet.
+  - hostname: hindsight.hieutk.dev
+    service: http://127.0.0.1:9999
+
+  - service: http_status:404

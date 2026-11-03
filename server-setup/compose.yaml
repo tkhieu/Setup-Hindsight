@@ -1,0 +1,103 @@
+# Our own compose file — there is no upstream docker-compose.yaml to check
+# out and override here (unlike Multica/Omnigent). Adapted from the official
+# external-pg example (verified against the v1.1.0 tag source):
+#   https://github.com/vectorize-io/hindsight/blob/main/docker/docker-compose/external-pg/docker-compose.yaml
+#
+# Differences from that example, all deliberate:
+#   - Both ports bound to 127.0.0.1 only (the example publishes 8888/9999
+#     unbound). Access from outside is via cloudflared only — see
+#     cloudflared/.
+#   - API key auth enabled (HINDSIGHT_API_TENANT_EXTENSION/_API_KEY) — the
+#     example ships unauthenticated by default.
+#   - hf_cache volume added so the embedding/reranker models baked into the
+#     image (pgvector/pgvector tag aside, this is about the hindsight image:
+#     docker/standalone/Dockerfile pre-downloads bge-small-en-v1.5 +
+#     ms-marco-MiniLM-L-6-v2 into /home/hindsight/.cache/huggingface when
+#     built, which is how the published ghcr.io/vectorize-io/hindsight tag
+#     is built) survive a container recreate instead of re-downloading.
+#   - json-file log rotation and healthchecks added (upstream ships
+#     neither).
+#   - db service not published at all (even the example's commented-out
+#     port line only suggests binding it; not exposing it is stricter and
+#     nothing outside the compose network needs it).
+#
+# Loaded via `docker compose -f compose.yaml --env-file version.env
+# --env-file base.env --env-file secrets.env` (bin/hs) — later --env-file
+# wins, and all three are available for ${VAR} interpolation below.
+
+services:
+  db:
+    image: pgvector/pgvector:pg${HINDSIGHT_DB_VERSION:?set HINDSIGHT_DB_VERSION in version.env}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
+      POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in secrets.env}
+      POSTGRES_DB: ${HINDSIGHT_DB_NAME:-hindsight_db}
+    volumes:
+      # Matches the official example exactly: the pgvector/pgvector image's
+      # entrypoint (postgres 18 base) uses /var/lib/postgresql/<major>/docker
+      # as PGDATA, not the pre-18 /var/lib/postgresql/data.
+      - pgdata:/var/lib/postgresql/${HINDSIGHT_DB_VERSION:-18}/docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${HINDSIGHT_DB_USER:-hindsight_user} -d ${HINDSIGHT_DB_NAME:-hindsight_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging: &json-rotated
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION:?set HINDSIGHT_VERSION in version.env}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${HINDSIGHT_API_HOST_PORT:-8888}:8888"
+      - "127.0.0.1:${HINDSIGHT_CP_HOST_PORT:-9999}:9999"
+    environment:
+      HINDSIGHT_API_DATABASE_URL: postgresql://${HINDSIGHT_DB_USER:-hindsight_user}:${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in secrets.env}@db:5432/${HINDSIGHT_DB_NAME:-hindsight_db}
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-openai}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:?set HINDSIGHT_API_LLM_API_KEY in secrets.env}
+      # ApiKeyTenantExtension — confirmed in
+      # hindsight_api/extensions/builtin/tenant.py. The value is a
+      # module:ClassName import path, not a bare class name.
+      HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+      HINDSIGHT_API_TENANT_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY:?set HINDSIGHT_API_TENANT_API_KEY in secrets.env}
+      # Lets the UI container call its own API when API key auth is on —
+      # confirmed in hindsight-control-plane/src/lib/hindsight-client.ts.
+      # Same key as above on purpose: there is only one tenant here.
+      HINDSIGHT_CP_DATAPLANE_API_KEY: ${HINDSIGHT_API_TENANT_API_KEY:?set HINDSIGHT_API_TENANT_API_KEY in secrets.env}
+      # UI's own login gate — confirmed in
+      # hindsight-control-plane/src/app/api/auth/login/route.ts. Separate
+      # secret from the API key above.
+      HINDSIGHT_CP_ACCESS_KEY: ${HINDSIGHT_CP_ACCESS_KEY:?set HINDSIGHT_CP_ACCESS_KEY in secrets.env}
+    volumes:
+      - hf_cache:/home/hindsight/.cache/huggingface
+    healthcheck:
+      # No curl/wget in this image's final stage (confirmed in
+      # docker/standalone/Dockerfile — only python:3.11-slim + apt packages
+      # that don't include either) — same gotcha Multica's RUNBOOK calls out
+      # for its own backend image. python3 is guaranteed (base image), so
+      # use it instead rather than guessing curl is there.
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=3)\"",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging: *json-rotated
+
+volumes:
+  pgdata:
+  # Seeded from the image on first use with the baked-in embedding/reranker
+  # models (and correct UID 1000 ownership — see docker/standalone/
+  # Dockerfile's comment on /home/hindsight/.pg0 for why that seeding only
+  # works because the path already exists in the image with that owner).
+  hf_cache:

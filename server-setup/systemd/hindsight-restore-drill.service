@@ -1,0 +1,10 @@
+# Installed by bin/install-systemd.sh, which resolves @CONFIG_DIR@.
+[Unit]
+Description=Hindsight monthly database restore drill
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@CONFIG_DIR@/bin/restore-db.sh --drill r2:latest
+TimeoutStartSec=3600

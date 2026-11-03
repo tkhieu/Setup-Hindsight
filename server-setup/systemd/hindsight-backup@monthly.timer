@@ -1,0 +1,12 @@
+[Unit]
+Description=Hindsight DB: promote to monthly
+
+[Timer]
+# Offset 5 min from Multica's (01:30:00) and Omnigent's (01:30:00) monthly
+# promote.
+OnCalendar=*-*-01 01:35:00
+Persistent=true
+Unit=hindsight-backup@monthly.service
+
+[Install]
+WantedBy=timers.target
