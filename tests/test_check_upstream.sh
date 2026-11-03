@@ -723,3 +723,48 @@ grep -qi "git identity\|pre-commit" "$CREATED_ISSUE_LOG_19" \
   || { echo "FAIL: expected a hint about git identity/hooks:"; cat "$CREATED_ISSUE_LOG_19"; exit 1; }
 rm -rf "$T19"
 echo "ok - git commit itself fails -> distinct 'version.env commit failed' issue, add+commit+push instructions, no rollback"
+
+# ============================================================================
+# Scenario: patch available, upgrade.sh exits 2 with NO pre-upgrade dump AND
+# its RECOVERY_KIND marker says "untouched" (the image pull itself failed,
+# hindsight was never stopped or restarted) -> the distinct "not applied;
+# old version verified running" issue — "restarted OK" would be wrong here
+# since nothing was ever restarted.
+# ============================================================================
+T20="$(mktemp -d)"
+setup_git "$T20" 1.1.0
+UPGRADE_LOG_20="$T20/upgrade.log"
+CREATED_ISSUE_LOG_20="$T20/created_issue.json"
+: > "$UPGRADE_LOG_20"
+: > "$CREATED_ISSUE_LOG_20"
+cat > "$T20/repo/server-setup/bin/upgrade.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$UPGRADE_LOG_20"
+echo "fake upgrade.sh: image pull failed" >&2
+echo "RECOVERY_KIND: untouched" >&2
+echo "hindsight is still healthy on 1.1.0 (verified, nothing was ever stopped or changed)." >&2
+exit 2
+EOF
+chmod +x "$T20/repo/server-setup/bin/upgrade.sh"
+git -C "$T20/repo" add -A
+git -C "$T20/repo" commit -q -m "add fake upgrade.sh"
+git -C "$T20/repo" push -q origin main
+
+BEFORE_SHA_20="$(git -C "$T20/repo" rev-parse main)"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_20"
+set +e
+out20="$(run_git "$T20" 2>&1)"
+rc20=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG
+
+[ "$rc20" -ne 0 ] || { echo "$out20"; echo "FAIL: expected a non-zero exit"; exit 1; }
+[ "$(git -C "$T20/repo" rev-parse main)" = "$BEFORE_SHA_20" ] \
+  || { echo "FAIL: a commit was made on main despite upgrade.sh failing before any version bump"; exit 1; }
+grep -q '"title":"Hindsight auto-upgrade to 1.1.1 not applied; old version verified running"' "$CREATED_ISSUE_LOG_20" \
+  || { echo "FAIL: missing the distinct not-applied/untouched issue:"; cat "$CREATED_ISSUE_LOG_20"; exit 1; }
+grep -qi "restarted OK\|restarted hindsight" "$CREATED_ISSUE_LOG_20" \
+  && { echo "FAIL: nothing was ever restarted — this issue must never claim a restart:"; cat "$CREATED_ISSUE_LOG_20"; exit 1; }
+rm -rf "$T20"
+echo "ok - upgrade.sh exit 2 with RECOVERY_KIND: untouched -> 'not applied; old version verified running' issue, never 'restarted OK'"

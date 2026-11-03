@@ -402,14 +402,25 @@ Release: $html_url"
       fi
       ;;
     2)
-      # upgrade.sh exits 2 for two distinct, both-VERIFIED-healthy cases:
-      # a real auto-rollback that succeeded (a pre-upgrade dump exists —
-      # the "pre-upgrade dump: ..." line is only ever printed after that
-      # backup step completes), or a failure BEFORE version.env was ever
-      # bumped (pull/stop/backup itself) where upgrade.sh just verified
-      # hindsight is still fine on $CUR (no dump needed). `|| true`: no
-      # match is a normal, expected outcome here, not a pipeline error (see
-      # bin/upgrade.sh's own `set -euo pipefail` note on this same grep).
+      # upgrade.sh exits 2 for THREE distinct, both-VERIFIED-healthy cases,
+      # told apart by the pre-upgrade dump line and the RECOVERY_KIND
+      # marker bin/upgrade.sh prints on every before-bump recovery (its
+      # on_exit: "restarted" when hindsight was actually stopped — or a
+      # stop was attempted and may have timed out — vs "untouched" when
+      # only the image pull failed and hindsight was never stopped at
+      # all, so nothing was ever restarted):
+      #   1. a real auto-rollback that succeeded (a pre-upgrade dump
+      #      exists — the "pre-upgrade dump: ..." line is only ever
+      #      printed after that backup step completes)
+      #   2. hindsight was actually stopped (or a stop was attempted) and
+      #      then successfully restarted (RECOVERY_KIND: restarted)
+      #   3. hindsight was never even stopped — only the image pull
+      #      failed — and was just confirmed still healthy, untouched
+      #      (RECOVERY_KIND: untouched); calling this "restarted OK" would
+      #      be flatly wrong, since nothing was ever restarted.
+      # `|| true`: no match is a normal, expected outcome here, not a
+      # pipeline error (see bin/upgrade.sh's own `set -euo pipefail` note
+      # on this same grep).
       pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')" || true
       if [ -n "$pre_dump" ]; then
         echo "upgrade.sh failed but auto-rollback succeeded and was VERIFIED (back on $CUR) — see the log tail in the issue being opened now." >&2
@@ -420,10 +431,19 @@ Release: $html_url
 
 --- log tail (secrets redacted) ---
 $(redact_log "$LOG" | tail -n 100)"
+      elif grep -q "RECOVERY_KIND: untouched" "$LOG"; then
+        echo "upgrade.sh failed before anything was touched (the image pull itself failed) — hindsight was never stopped, just confirmed still healthy on $CUR." >&2
+        title="Hindsight auto-upgrade to $ver not applied; old version verified running"
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before hindsight was ever stopped (the image pull itself failed) — the upgrade was never applied, nothing was touched or restarted, and bin/upgrade.sh VERIFIED hindsight is still running fine on $CUR (version.env pin + the running container's image + /health all checked).
+
+Release: $html_url
+
+--- log tail (secrets redacted) ---
+$(redact_log "$LOG" | tail -n 100)"
       else
-        echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was confirmed still healthy on $CUR (restarted first if it had actually been stopped)." >&2
+        echo "upgrade.sh failed before changing anything (no pre-upgrade dump was ever taken) — hindsight was stopped (or a stop was attempted) and has been restarted and VERIFIED healthy on $CUR." >&2
         title="Hindsight auto-upgrade to $ver failed before changing anything (restarted OK)"
-        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (the image pull, stopping hindsight, or the pre-upgrade backup itself) — nothing in the database was touched, no dump was needed. bin/upgrade.sh VERIFIED hindsight is still healthy on $CUR afterward (version.env pin + the running container's image + /health all checked) — restarting it first only if it had actually been stopped (a pull failure alone never stops it).
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (hindsight was stopped, or a stop was attempted, before the pre-upgrade backup itself failed) — nothing in the database was touched, no dump was needed. bin/upgrade.sh restarted hindsight and VERIFIED it is healthy on $CUR afterward (version.env pin + the running container's image + /health all checked).
 
 Release: $html_url
 
@@ -438,8 +458,9 @@ $(redact_log "$LOG" | tail -n 100)"
       # Anything else (3 = the verified-recovery check ITSELF failed, or
       # any unexpected code) is treated as the worst case on purpose:
       # hindsight's actual state is unknown/bad and needs a human NOW. Same
-      # dump-present/absent split as exit 2 above decides whether a real
-      # rollback (with a dump to restore) or just a restart was attempted.
+      # three-way split as exit 2 above (dump present / RECOVERY_KIND
+      # untouched / RECOVERY_KIND restarted) decides which manual-recovery
+      # text applies.
       pre_dump="$(grep -o 'pre-upgrade dump.*: .*' "$LOG" | tail -1 | sed 's/.*: //')" || true
       echo "upgrade.sh failed and the recovery could not be VERIFIED (exit $upgrade_rc) — manual action needed now." >&2
       if [ -n "$pre_dump" ]; then
@@ -459,9 +480,21 @@ Release: $html_url
 
 --- log tail (secrets redacted) ---
 $(redact_log "$LOG" | tail -n 100)"
+      elif grep -q "RECOVERY_KIND: untouched" "$LOG"; then
+        title="Hindsight auto-upgrade to $ver not applied; old version could not be verified — manual action needed"
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before hindsight was ever stopped (the image pull itself failed) — the upgrade was never applied, but bin/upgrade.sh could NOT verify hindsight is still healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check manually:
+  cd $CONFIG_DIR
+  bin/hs ps
+  bin/hs ready
+  bin/hs logs hindsight
+
+Release: $html_url
+
+--- log tail (secrets redacted) ---
+$(redact_log "$LOG" | tail -n 100)"
       else
         title="Hindsight auto-upgrade to $ver failed before changing anything AND the restart could not be verified — manual action needed"
-        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened, and bin/upgrade.sh could NOT verify hindsight is healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check and restart manually:
+        body="An attempt to automatically upgrade Hindsight $CUR -> $ver FAILED before any version switch happened (hindsight was stopped, or a stop was attempted), and bin/upgrade.sh could NOT verify hindsight is healthy on $CUR afterward (exit $upgrade_rc). No dump was ever taken — there is nothing to restore, version.env should still read $CUR. Check and restart manually:
   cd $CONFIG_DIR
   bin/hs ps
   bin/hs up -d

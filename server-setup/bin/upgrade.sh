@@ -239,11 +239,17 @@ on_exit() {
     print_rollback
     exit "$status"
   elif [ "$STOPPED" = 1 ]; then
-    # Hindsight WAS actually stopped (the backup step failed, or `hs stop`
-    # itself reported success but hindsight was somehow still up) — unlike
-    # a pull failure below, there is something real to restart here.
+    # Hindsight WAS actually stopped (or a stop was at least attempted and
+    # may have timed out mid-way — the backup step failed, `hs stop` itself
+    # timed out, or it reported success but hindsight was somehow still
+    # up) — unlike a pull failure below, there is something real to
+    # restart here. RECOVERY_KIND is a machine-readable marker (not prose
+    # that could get reworded) bin/check-upstream.sh greps for in the log
+    # to pick the right issue title/body — never both "RECOVERY_KIND:" and
+    # the other branch's marker will appear in the same run.
+    echo "RECOVERY_KIND: restarted" >&2
     echo >&2
-    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back (no pre-upgrade dump exists yet either), but hindsight was stopped." >&2
+    echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back (no pre-upgrade dump exists yet either), but hindsight was stopped (or a stop was attempted)." >&2
     echo "Restarting hindsight on $CUR..." >&2
     if [ "$AUTO_ROLLBACK" = 1 ]; then
       if timeout "$HS_TIMEOUT" "$HS" up -d && verify_on_version "$CUR"; then
@@ -270,6 +276,7 @@ on_exit() {
     # flags, behave exactly as before this script ever had a trap for the
     # pull step: just re-raise the original exit status, no extra noise.
     if [ "$AUTO_ROLLBACK" = 1 ]; then
+      echo "RECOVERY_KIND: untouched" >&2
       echo >&2
       echo "Upgrade aborted before anything was touched (e.g. the image pull failed) — verifying hindsight is still fine on $CUR, untouched..." >&2
       if verify_on_version "$CUR"; then
@@ -302,8 +309,17 @@ say "3/7 Stopping hindsight (db stays up) so the backup below is final"
 # Stopping first means the dump taken in the next step is provably the
 # exact state the old version left behind — nothing written after it,
 # nothing missing from it.
-timeout "$HS_TIMEOUT" "$HS" stop hindsight
+# STOPPED is set BEFORE attempting the stop, not after it succeeds: an
+# ATTEMPTED stop already counts as "touched" — if this command itself
+# times out, docker may well finish stopping the container just after
+# `timeout` kills this script's wait on it, leaving hindsight down. Setting
+# STOPPED=1 only on success would then take on_exit's "nothing touched"
+# branch (no restart, no `hs up -d`) and could report healthy without ever
+# checking. Marking it touched up front means a stop timeout instead goes
+# through the restart-and-verify path and only exits 2 if that verification
+# actually passes.
 STOPPED=1
+timeout "$HS_TIMEOUT" "$HS" stop hindsight
 running_services="$(timeout "$HS_TIMEOUT" "$HS" ps --services --status running)"
 if printf '%s\n' "$running_services" | grep -qx hindsight; then
   echo "ERROR: hindsight is still running after 'hs stop hindsight' — aborting before touching anything else." >&2

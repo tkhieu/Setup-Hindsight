@@ -517,3 +517,58 @@ printf '%s\n' "$outG" | grep -q "AUTO-ROLLBACK OK" && { echo "$outG"; echo "FAIL
 
 rm -rf "$TG"
 echo "ok - a stalled 'hs up -d' during auto-rollback is bounded by \$HINDSIGHT_HS_TIMEOUT and exits 3"
+
+# ============================================================================
+# Scenario H: the INITIAL `hs stop hindsight` (step 3/7) itself hangs past
+# $HINDSIGHT_HS_TIMEOUT, before version.env is ever bumped. STOPPED must be
+# marked BEFORE this call is even attempted — an attempted stop counts as
+# "touched" even if it times out, since docker may finish stopping it right
+# after `timeout` gives up. Must go through the restart-and-verify path
+# (calling `hs up -d`), NOT the "nothing touched" path (which never calls
+# `hs up -d` at all) — and exit 2 once that restart is verified healthy.
+# ============================================================================
+TH="$(mktemp -d)"
+setup_common "$TH"
+
+HS_LOG_H="$TH/hs.log"
+: > "$HS_LOG_H"
+
+cat > "$TH/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_H"
+case "\$1" in
+  pull) exit 0 ;;
+  stop) sleep 30 ;;  # hangs well past HINDSIGHT_HS_TIMEOUT below
+  ps)
+    shift
+    case "\$*" in
+      *--format*) echo "ghcr.io/vectorize-io/hindsight:\$(grep '^HINDSIGHT_VERSION=' "$TH/version.env" | cut -d= -f2)" ;;
+      *) ;;
+    esac
+    exit 0 ;;
+  up) exit 0 ;;
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TH/bin/hs"
+
+cd "$TH"
+set +e
+START_H="$(date +%s)"
+outH="$(PATH="$TH/bin:$PATH" HINDSIGHT_HS_TIMEOUT=2 ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcH=$?
+END_H="$(date +%s)"
+set -e
+cd "$HERE"
+
+[ "$rcH" -eq 2 ] || { echo "$outH"; echo "FAIL: expected upgrade.sh to exit 2 (restart attempted + verified) when the initial 'hs stop' itself hangs, got $rcH"; exit 1; }
+[ $((END_H - START_H)) -le 20 ] \
+  || { echo "FAIL: upgrade.sh took $((END_H - START_H))s — the stalled 'hs stop' was not bounded by HINDSIGHT_HS_TIMEOUT"; exit 1; }
+grep -q '^up\b\| up ' "$HS_LOG_H" \
+  || { echo "FAIL: 'hs up' must have been called (STOPPED=1 before the attempt means this goes through the restart path), got:"; cat "$HS_LOG_H"; exit 1; }
+printf '%s\n' "$outH" | grep -qi "RECOVERY_KIND: restarted" \
+  || { echo "$outH"; echo "FAIL: a timed-out stop must take the 'restarted' recovery path, not 'untouched'"; exit 1; }
+
+rm -rf "$TH"
+echo "ok - a stalled initial 'hs stop' is treated as touched (restart+verify attempted), not 'nothing touched'"
