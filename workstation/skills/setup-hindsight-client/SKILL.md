@@ -15,5 +15,6 @@ Khi lỗi:
 - Không kết nối hoặc `/health` lỗi: kiểm tra DNS, Cloudflare Tunnel và dịch vụ Hindsight trên server.
 - Không thấy ký ức đúng: so sánh `HINDSIGHT_BANK` trên các máy; cài lại sau khi đổi bank. Bank chỉ xuất hiện sau khi có dữ liệu.
 - MCP hoặc hook thiếu: chạy lại `install`, kiểm tra `~/.claude/settings.json`, `~/.codex/hooks.json` và `~/.codex/config.toml`; khởi động phiên agent mới.
+- Nếu thấy cảnh báo `Codex hooks chưa bật`, thêm `[features]` và `hooks = true` vào `~/.codex/config.toml`, rồi mở phiên Codex mới.
 
 `--uninstall` giữ lại file chứa khóa và cấu hình Hindsight để người dùng có thể cài lại. Không tự ý xóa các file này.

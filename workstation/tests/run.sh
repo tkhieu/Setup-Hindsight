@@ -10,13 +10,22 @@ mkdir -p "$HOME" "$scratch/bin"
 export PATH="$scratch/bin:$PATH"
 export CALLS="$scratch/calls"
 : > "$CALLS"
+export ARGV_LOG="$scratch/argv"
+export CURL_CONFIG_LOG="$scratch/curl-config"
+: > "$ARGV_LOG"
+: > "$CURL_CONFIG_LOG"
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok: %s\n' "$1"; }
 
 cat > "$scratch/bin/curl" <<'EOF'
 #!/bin/sh
+printf 'curl\0' >> "$ARGV_LOG"
+printf '%s\0' "$@" >> "$ARGV_LOG"
 printf 'curl %s\n' "$*" >> "$CALLS"
+case " $* " in
+  *' --config - '*) cat >> "$CURL_CONFIG_LOG";;
+esac
 if [ "${FAKE_CURL_CODE-}" ]; then
     printf '%s' "$FAKE_CURL_CODE"
     exit 0
@@ -29,15 +38,21 @@ esac
 EOF
 cat > "$scratch/bin/claude" <<'EOF'
 #!/bin/sh
+printf 'claude\0' >> "$ARGV_LOG"
+printf '%s\0' "$@" >> "$ARGV_LOG"
 printf 'claude %s\n' "$*" >> "$CALLS"
 EOF
 cat > "$scratch/bin/codex" <<'EOF'
 #!/bin/sh
+printf 'codex\0' >> "$ARGV_LOG"
+printf '%s\0' "$@" >> "$ARGV_LOG"
 printf 'codex %s\n' "$*" >> "$CALLS"
 EOF
 cat > "$scratch/bin/npx" <<'EOF'
 #!/bin/sh
 set -eu
+printf 'npx\0' >> "$ARGV_LOG"
+printf '%s\0' "$@" >> "$ARGV_LOG"
 printf 'npx %s\n' "$*" >> "$CALLS"
 if [ "${FAKE_NPX_FAIL-}" ]; then
     printf 'failed with %s\n' "$HINDSIGHT_API_KEY" >&2
@@ -91,6 +106,7 @@ grep -q '^hooks = true # hindsight-client-setup$' "$HOME/.codex/config.toml" || 
 grep -q '\[mcp_servers.hindsight\]' "$HOME/.codex/config.toml" || fail 'Codex MCP missing'
 grep -q '/health' "$CALLS" || fail 'health not checked'
 grep -q '/v1/default/banks' "$CALLS" || fail 'auth not checked'
+grep -q "Authorization: Bearer $HINDSIGHT_API_KEY" "$CURL_CONFIG_LOG" || fail 'auth header missing from curl stdin config'
 ! grep -q "$HINDSIGHT_API_KEY" "$scratch/output" || fail 'install leaked key'
 pass 'install configures official integration, preserves Codex config, and verifies API'
 
@@ -127,4 +143,15 @@ if "$installer" install > "$scratch/output" 2>&1; then fail 'npx failure should 
 unset FAKE_NPX_FAIL
 pass 'upstream failure cannot echo key'
 
-printf '7 test cases passed\n'
+export HOME="$scratch/home-no-features"
+mkdir -p "$HOME/.codex"
+printf 'model = "keep-me"\n' > "$HOME/.codex/config.toml"
+"$installer" install > "$scratch/output" 2>&1 || fail 'install without features table'
+grep -q 'Codex hooks chưa bật' "$scratch/output" || fail 'missing Codex hooks warning'
+grep -q 'hooks = true' "$scratch/output" || fail 'Codex hooks fix missing'
+pass 'missing Codex features table gives actionable warning'
+
+! grep -aFq "$HINDSIGHT_API_KEY" "$ARGV_LOG" || fail 'secret appeared in child process argv'
+pass 'curl, npx, claude, and codex argv never contain the key'
+
+printf '9 test cases passed\n'
