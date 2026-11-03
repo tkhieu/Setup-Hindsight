@@ -15,6 +15,7 @@ cp "$SS/bin/backup.sh" "$TMP/bin/backup.sh"
 cp "$SS/bin/backup-r2.sh" "$TMP/bin/backup-r2.sh"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
 cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
+cp "$SS/bin/lib/lock.sh" "$TMP/bin/lib/lock.sh"
 chmod +x "$TMP/bin/backup.sh" "$TMP/bin/backup-r2.sh"
 
 # Fake hs: `exec ... pg_dump` writes a few bytes (simulating a dump that

@@ -5,9 +5,12 @@ Description=Hindsight weekly upstream release check
 # No TZ suffix -> this runs on the system's LOCAL time, whatever that is
 # set to (UTC or Asia/Saigon — check `timedatectl`; see docs/PLAYBOOK.md
 # §5/§8b for both interpretations). Sun 02:00 is well clear of the Sun
-# 01:15/01:20 backup timers (Multica/Omnigent/Hindsight) — this never
-# overlaps them, and additionally takes its own flock (bin/check-upstream.sh)
-# so it can never overlap a second run of itself either.
+# 01:15/01:20 backup timers (Multica/Omnigent/Hindsight); on top of that,
+# bin/check-upstream.sh takes the same shared flock
+# (server-setup/.ops.lock, bin/lib/lock.sh) as every backup/restore/
+# upgrade script, so none of them can ever run concurrently regardless of
+# scheduling — this offset is just to avoid making that lock-wait the
+# common case.
 OnCalendar=Sun *-*-* 02:00:00
 Persistent=true
 RandomizedDelaySec=180

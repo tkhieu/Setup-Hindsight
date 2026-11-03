@@ -270,6 +270,11 @@ mã hóa. Mất server thì đăng nhập ChatGPT và chuyển credential lại 
 Tự động qua systemd user timer (`Persistent=true` nên chạy bù lần bị lỡ khi
 máy reboot — vòng lặp sleep trong container không có cơ chế này).
 
+`bin/backup.sh`/`bin/backup-r2.sh` cầm khoá `flock` dùng chung với
+restore/upgrade/check-upstream (`server-setup/.ops.lock`, chờ tối đa 1 giờ)
+— xem §8b để biết chi tiết cơ chế và cách đọc lỗi "could not acquire
+.ops.lock".
+
 ⚠️ **`OnCalendar=` trong các file `.timer` không có hậu tố timezone, nên
 systemd hiểu nó theo giờ LOCAL của hệ thống** — có thể là UTC hoặc đã là
 Asia/Saigon, tuỳ máy được cài thế nào. Kiểm tra trước khi tin bảng dưới:
@@ -433,6 +438,10 @@ sống. Container tạm luôn bị xoá ở cuối (`docker rm -f`), dù kết q
 
 ### Lịch tự động
 
+`bin/restore-db.sh` (cả restore thật và `--drill`) cầm khoá `flock` dùng
+chung với backup/upgrade/check-upstream (`server-setup/.ops.lock` — xem
+§8b).
+
 Timer `hindsight-restore-drill.timer` chạy `--drill r2:latest` (không có
 `--drill-full`, vì nó cần mở thêm port và tốn thêm vài chục giây — không
 cần chạy tự động hằng tháng), `OnCalendar=*-*-14 20:30:00` (`RandomizedDelaySec=900`).
@@ -548,15 +557,27 @@ nào đổi được:**
   bình thường).
 - Prerelease/draft và version cũ hơn hiện tại: bỏ qua lặng lẽ (`exit 0`,
   không issue).
-- Lỗi gọi API GitHub (403/5xx) hoặc không thấy tag trên GHCR: log lỗi,
-  `exit 1`, **không** mở issue — tránh spam khi chính bước kiểm tra bị lỗi.
+- Lỗi gọi API GitHub lúc lấy release (403/5xx) hoặc không thấy tag trên
+  GHCR: log lỗi, `exit 1`, **không** mở issue — tránh spam khi chính bước
+  kiểm tra bị lỗi.
+- Lỗi gọi API GitHub ở BẤT KỲ bước nào liên quan tới issue (tạo label khác
+  422 "đã tồn tại", liệt kê issue để chống trùng, tạo issue) cũng luôn
+  `exit` khác 0, và **không bao giờ tạo issue sau một lượt tìm-trùng bị
+  lỗi** (lượt tìm đó chính là thứ duy nhất chặn việc tạo trùng — lỗi ở đó
+  mà vẫn tạo tiếp thì mất hết tác dụng chống trùng).
 - Repo trên server dirty, hoặc không đang ở branch `main`, hoặc `main` lệch
   so với `origin/main` (không fast-forward được): không tự upgrade, mở
   issue "...auto-upgrade blocked (repo not clean)" thay vào đó.
+- Upgrade xong + push thành công, nhưng việc MỞ ISSUE báo tin lại lỗi: vẫn
+  `exit` khác 0 (để biết mà xem log/journal), nhưng **không** rollback —
+  hindsight đã khoẻ trên version mới, đây chỉ là lỗi thông báo.
 - **Chống trùng issue:** mọi issue gắn label `hindsight-upgrade`; trước khi
-  tạo mới, script tìm issue ĐANG OPEN có đúng title (REST API, không phải
-  so gần đúng) — có rồi thì không tạo thêm. Tối đa 1 issue cho mỗi cặp
-  (loại thông báo, version).
+  tạo mới, script liệt kê TẤT CẢ issue có label đó ở **MỌI trạng thái**
+  (`state=all` — cả đã đóng, không chỉ đang mở) qua REST API, phân trang
+  (`per_page=100`, lặp trang tới khi rỗng) cho tới khi tìm đúng title khớp
+  y chang — có rồi (dù đang mở hay đã đóng) thì không tạo thêm. Tối đa 1
+  issue cho mỗi cặp (loại thông báo, version), kể cả sau khi issue cũ đã
+  được đóng tay.
 
 **Tạo token `GITHUB_ISSUE_TOKEN` (`secrets.env`):**
 1. GitHub → Settings → Developer settings → **Fine-grained tokens** →
@@ -575,23 +596,57 @@ Token này cũng được gửi kèm khi gọi API release của
 auth) — an toàn vì fine-grained token mặc định có quyền đọc MỌI repo
 public, không chỉ repo chọn ở bước 2.
 
-**Khoá chạy đơn:** script tự cầm `flock` riêng
-(`server-setup/.check-upstream.lock`) — không dùng chung với
-backup/restore-drill vì hai cái đó hiện chưa có khoá nào. Chạy tay khi timer
-đang chạy sẽ thấy `another run is already in progress` và `exit 1` ngay,
-không chờ.
+**`python3` là bắt buộc.** Mọi JSON (release info, GHCR token, liệt kê/tạo
+issue) đi qua `python3` (`server-setup/bin/lib/json.sh`) — không có
+fallback `sed`/`awk`. `check-upstream.sh` kiểm `command -v python3` ngay
+dòng đầu và `exit 1` rõ ràng nếu thiếu, trước khi chạm vào bất cứ gì khác.
+`python3` vốn đã là dependency bắt buộc của `bin/install-systemd.sh`
+(script đó tự kiểm `curl`/`unzip`/`docker`/`python3` trước khi cài gì), và
+đã được xác nhận có sẵn trên server.
+
+**Khoá chạy đơn — DÙNG CHUNG với mọi script khác đụng tới DB/app.**
+`server-setup/.ops.lock` (gitignored) là một khoá `flock` DUY NHẤT, được
+`bin/check-upstream.sh`, `bin/upgrade.sh`, `bin/backup.sh`,
+`bin/backup-r2.sh` và `bin/restore-db.sh` (kể cả `--drill`) cùng cầm
+(`bin/lib/lock.sh`) — không script nào trong năm script này chạy chồng lên
+script khác, bất kể lịch timer có tình cờ trùng giờ hay không.
+
+- **Re-entrant trong một cây process:** `check-upstream.sh` tự chạy
+  `upgrade.sh` làm con, và `upgrade.sh` (khi `--auto-rollback` cần) lại tự
+  chạy `restore-db.sh` làm con của nó — cả ba cùng dùng một khoá. Process
+  đầu tiên cầm khoá sẽ export `HINDSIGHT_OPS_LOCK_HELD=1`; mọi script con
+  kế thừa biến môi trường này và **bỏ qua việc cầm khoá lại** — không thì
+  tự deadlock với chính fd nó đang giữ. Khoá chỉ thật sự nhả khi process
+  NGOÀI CÙNG (cái cầm khoá đầu tiên) kết thúc, tức là sau khi mọi script
+  con đồng bộ đã chạy xong.
+- **Chờ có giới hạn, không chờ vô thời hạn:** `flock -w
+  ${HINDSIGHT_OPS_LOCK_TIMEOUT:-3600}` (mặc định 1 giờ — đủ trùm một lượt
+  patch auto-upgrade kể cả khi phải auto-rollback). Hết giờ mà chưa cầm
+  được thì in `could not acquire .ops.lock within ...s — another
+  backup/restore/upgrade/check-upstream run is in progress` và `exit 1`
+  ngay, không treo mãi.
+- **`--dry-run` KHÔNG cầm khoá** (và vì vậy cũng không tạo file
+  `.ops.lock`) — chế độ này chỉ đọc, không cần loại trừ lẫn nhau với gì cả.
 
 **Auto-rollback hoạt động thế nào (và mất dữ liệu đến đâu):** giống đúng
 quy trình rollback thủ công ở §8 — dừng `hindsight`, trả `version.env` về
 version cũ, `bin/restore-db.sh --yes --no-start` đúng bản dump pre-upgrade,
 `up -d` + chờ `/health` trên version cũ — chỉ khác là làm tự động thay vì
-in lệnh ra cho người chạy tay. **Khoảng mất dữ liệu:** `bin/upgrade.sh` dừng
-`hindsight` TRƯỚC khi lấy bản dump pre-upgrade (§8), nên bản dump đó là
-đúng-y trạng thái cuối của version cũ — chưa mất gì tính đến lúc đó. Chỉ
-những ghi dữ liệu xảy ra SAU khi version mới `up -d` trong CHÍNH lần chạy
-auto-upgrade đó (và trước khi lỗi bị phát hiện) mới mất khi rollback — cửa
-sổ này không tích lũy qua nhiều lần chạy, chỉ tồn tại trong một lần upgrade
-đang thất bại.
+in lệnh ra cho người chạy tay. `bin/upgrade.sh --auto-rollback` phân biệt
+rõ hai kết quả bằng exit code:
+
+| Exit code | Nghĩa |
+|---|---|
+| `0` | Upgrade thành công. |
+| `2` | Upgrade fail, nhưng auto-rollback THÀNH CÔNG — hindsight đã trở lại version cũ và khoẻ. |
+| `3` | Upgrade fail VÀ auto-rollback cũng fail — trạng thái hindsight trên server không rõ/có thể hỏng, cần người can thiệp ngay. |
+
+**Khoảng mất dữ liệu:** `bin/upgrade.sh` dừng `hindsight` TRƯỚC khi lấy bản
+dump pre-upgrade (§8), nên bản dump đó là đúng-y trạng thái cuối của
+version cũ — chưa mất gì tính đến lúc đó. Chỉ những ghi dữ liệu xảy ra SAU
+khi version mới `up -d` trong CHÍNH lần chạy auto-upgrade đó (và trước khi
+lỗi bị phát hiện) mới mất khi rollback — cửa sổ này không tích lũy qua
+nhiều lần chạy, chỉ tồn tại trong một lần upgrade đang thất bại.
 
 **Đọc journal:**
 ```bash
@@ -600,12 +655,26 @@ systemctl --user list-timers hindsight-upgrade-check.timer
 systemctl --user start hindsight-upgrade-check    # chạy ngay, không đợi lịch
 ```
 
+**Không `stop`/`restart` service này giữa lúc đang chạy.** Timer không có
+`TimeoutStartSec` (vô hạn — dựa hẳn vào các giới hạn thời gian bên trong
+script, không phải systemd, để không bao giờ bị `SIGTERM` giữa lúc đang
+restore), nên một lượt chạy auto-rollback có thể kéo dài vài phút mà vẫn
+bình thường. Trước khi `stop`/`restart` tay, kiểm xem có đang chạy không:
+
+```bash
+systemctl --user status hindsight-upgrade-check     # "active (running)"?
+fuser server-setup/.ops.lock 2>/dev/null             # PID nào đang giữ khoá?
+pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
+```
+
 **Issue nghĩa là gì:**
 
 | Title | Nghĩa |
 |---|---|
 | `Hindsight auto-upgraded to X.Y.Z` | Patch đã tự nâng xong, smoke test pass, `version.env` đã commit + push. |
-| `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` | Patch tự nâng fail, đã auto-rollback về version cũ; `version.env` KHÔNG đổi, không commit/push. Log tail (đã redact secret) nằm trong issue. |
+| `Hindsight auto-upgraded to X.Y.Z but version.env push failed` | Upgrade + smoke pass, hindsight đang khoẻ trên `X.Y.Z` — nhưng commit/push `version.env` trên server lỗi. KHÔNG cần rollback, chỉ cần tự `git add/commit/push` lại (lệnh chính xác nằm trong issue). |
+| `Hindsight auto-upgrade to X.Y.Z failed (rolled back)` | Patch tự nâng fail, auto-rollback THÀNH CÔNG (`upgrade.sh` exit `2`) — đã về version cũ, khoẻ; `version.env` KHÔNG đổi, không commit/push. Log tail (đã redact secret) nằm trong issue. |
+| `Hindsight auto-upgrade to X.Y.Z failed AND rollback failed — manual action needed` | Patch tự nâng fail VÀ auto-rollback cũng fail (`upgrade.sh` exit `3`, hoặc bất kỳ code lạ khác) — trạng thái hindsight KHÔNG RÕ, cần làm theo lệnh restore tay trong issue (đường dẫn bản dump pre-upgrade + lệnh §6/§8) NGAY. |
 | `Hindsight X.Y.Z available (manual upgrade)` | Có bản MINOR/MAJOR mới — xem xét rồi tự chạy `bin/upgrade.sh X.Y.Z` khi sẵn sàng. |
 | `Hindsight X.Y.Z available but auto-upgrade blocked (repo not clean)` | Có patch mới nhưng repo trên server dirty / lệch `origin/main` — dọn repo (`git status`, `git pull`) rồi chạy tay `bin/upgrade.sh X.Y.Z`. |
 
@@ -631,8 +700,11 @@ systemctl --user start hindsight-upgrade-check    # chạy ngay, không đợi l
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |
 | Diễn tập restore fail "table missing/empty" | xem §7 "Đọc kết quả thế nào" | |
 | `check-upstream.sh` không tạo issue, chỉ log `NOTE/WARNING` | thiếu `GITHUB_ISSUE_TOKEN` trong `secrets.env` | tạo token theo §8b nếu muốn có issue; patch vẫn tự nâng dù thiếu token |
-| `check-upstream.sh` báo "another run is already in progress" | một lần chạy khác (tay hoặc timer) đang giữ `.check-upstream.lock` | đợi lần đó xong; không phải lỗi |
+| `check-upstream.sh`/`upgrade.sh`/`backup.sh`/`restore-db.sh` báo "could not acquire .ops.lock" | một script khác trong cùng nhóm đang giữ khoá chung (§8b) lâu hơn timeout | `fuser server-setup/.ops.lock`/`pgrep -af 'bin/upgrade.sh\|bin/restore-db.sh'` xem ai đang chạy; đợi xong hoặc tăng `HINDSIGHT_OPS_LOCK_TIMEOUT` |
+| `check-upstream.sh` báo thiếu `python3` ngay dòng đầu | `python3` không có trên `PATH` | cài `python3` (đã là dependency bắt buộc của `bin/install-systemd.sh`) |
 | Patch mới nhưng issue báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
+| Issue báo "...failed AND rollback failed — manual action needed" | cả upgrade và auto-rollback đều fail (`upgrade.sh` exit `3`) | làm theo lệnh restore tay trong issue NGAY (§6/§8), đừng đợi lần chạy tuần sau |
+| Issue báo "...but version.env push failed" | upgrade + smoke pass nhưng git commit/push trên server lỗi | hindsight đang khoẻ, không cần rollback — chỉ `git add/commit/push` lại theo lệnh trong issue |
 | Muốn xem compose đã resolve image/port/volume đúng chưa | `hs config` (không flag) in MỌI secret đã resolve ra stdout | chỉ dùng `hs config --services` hoặc `hs config --quiet` (validate, không in secret); hai flag này cố ý là lựa chọn DUY NHẤT được cho phép |
 
 **Đọc log đúng chỗ:**

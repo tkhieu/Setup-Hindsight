@@ -7,8 +7,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=@CONFIG_DIR@/bin/check-upstream.sh
-# Covers the patch auto-upgrade path end to end: pull + stop + local backup
-# + best-effort R2 snapshot + up + wait-for-ready (up to 5 min of that is
-# bin/upgrade.sh's own budget) + smoke test, with margin for a cold image
-# pull. See docs/PLAYBOOK.md §8b.
-TimeoutStartSec=1200
+# No outer timeout: the patch auto-upgrade path (pull + stop + backup + up
+# + wait-ready + smoke, and on failure an auto-rollback doing stop +
+# restore + up + wait-ready again) is already bounded by the script's OWN
+# waits — bin/hs ready's HINDSIGHT_READY_TIMEOUT, curl --max-time on every
+# network call, bin/lib/lock.sh's own flock -w. A finite TimeoutStartSec
+# here could SIGTERM the process mid-restore, which is worse than any
+# plausible hang. See docs/PLAYBOOK.md §8b.
+TimeoutStartSec=infinity
+# Still give a clean `systemctl --user stop` more room than the 90s
+# default before SIGKILL — this is not a guarantee a stop issued mid-run
+# is safe, only that it is not needlessly abrupt. Do not stop or restart
+# this service by hand while a run might be mid-restore; check first
+# (docs/PLAYBOOK.md §8b: is server-setup/.ops.lock held, is bin/upgrade.sh
+# or bin/restore-db.sh running).
+TimeoutStopSec=120

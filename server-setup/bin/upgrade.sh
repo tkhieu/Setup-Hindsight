@@ -12,9 +12,16 @@
 #                   hindsight, revert version.env to the old version, restore
 #                   the exact pre-upgrade dump via bin/restore-db.sh --yes
 #                   --no-start, start hindsight back up on the old version
-#                   and verify /health. Exits non-zero either way — the
-#                   upgrade itself still failed, regardless of whether the
-#                   rollback succeeds.
+#                   and verify /health. Exit code distinguishes the outcome:
+#                     2 = upgrade failed, but the rollback itself succeeded
+#                         (hindsight is back on the OLD version and healthy)
+#                     3 = the rollback ALSO failed (unknown/bad state —
+#                         manual action needed now; see the log for exactly
+#                         which rollback step failed and the pre-upgrade
+#                         dump path)
+#                   Without --auto-rollback, a failure after version.env was
+#                   bumped keeps exiting 1 (unchanged) and only prints the
+#                   rollback commands instead of running them.
 # --smoke           after /health is ready, also run bin/smoke.sh. A smoke
 #                   failure is treated the same as a failed /health wait
 #                   (triggers --auto-rollback if given).
@@ -29,6 +36,8 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 REPO_ROOT="$(cd "$CONFIG_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/lock.sh"
 HS="$CONFIG_DIR/bin/hs"
 
 YES=0
@@ -50,6 +59,11 @@ done
 # Guards against a typo/garbage argument being embedded verbatim into sed
 # below (this doubles as the rollback text).
 [[ "$NEW" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "invalid version: $NEW" >&2; exit 1; }
+
+# Before touching anything: serializes against backup/restore-drill/another
+# upgrade, and is a no-op if a parent (bin/check-upstream.sh) already holds
+# it — see bin/lib/lock.sh.
+acquire_ops_lock "$CONFIG_DIR"
 
 CUR="$(env_get "$CONFIG_DIR/version.env" HINDSIGHT_VERSION)"
 [ -n "$CUR" ] || { echo "missing HINDSIGHT_VERSION in $CONFIG_DIR/version.env" >&2; exit 1; }
@@ -118,8 +132,9 @@ if the restore itself failed, in which case do not proceed to step 4.
 TXT
 }
 # Runs the exact commands print_rollback above only prints, for --auto-rollback.
-# Always returns 0 — any failure inside it is reported but must not mask the
-# original (already non-zero) exit status on_exit is about to propagate.
+# Returns 0 if hindsight ends up back on $CUR and healthy, 1 if any step of
+# the rollback itself failed (unknown/bad state) — on_exit below turns that
+# into the distinct exit code 2 / 3 documented at the top of this file.
 do_auto_rollback() {
   echo "AUTO-ROLLBACK: restoring $CUR from $PRE_DUMP" >&2
   if ! "$HS" stop hindsight; then
@@ -128,27 +143,32 @@ do_auto_rollback() {
   sed -i "s|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=$CUR|" "$CONFIG_DIR/version.env"
   if ! "$CONFIG_DIR/bin/restore-db.sh" --yes --no-start "$PRE_DUMP"; then
     echo "ERROR: auto-rollback's restore-db.sh failed — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $PRE_DUMP" >&2
-    return
+    return 1
   fi
   if ! "$HS" up -d; then
     echo "ERROR: auto-rollback could not start hindsight on $CUR — run manually: $HS up -d" >&2
-    return
+    return 1
   fi
   if ! "$HS" ready; then
     echo "ERROR: hindsight on $CUR did not become ready after auto-rollback — check: $HS logs hindsight" >&2
-    return
+    return 1
   fi
   echo "AUTO-ROLLBACK OK — hindsight is back on $CUR and healthy." >&2
+  return 0
 }
 on_exit() {
   local status=$?
   [ "$FAILED" = 1 ] || exit "$status"
   if [ "$VERSION_BUMPED" = 1 ]; then
     if [ "$AUTO_ROLLBACK" = 1 ]; then
-      do_auto_rollback
-    else
-      print_rollback
+      if do_auto_rollback; then
+        exit 2
+      else
+        exit 3
+      fi
     fi
+    print_rollback
+    exit "$status"
   else
     echo >&2
     echo "Upgrade aborted before version.env changed — still at $CUR, nothing in the database to roll back." >&2
@@ -158,8 +178,8 @@ on_exit() {
     else
       echo "ERROR: could not restart hindsight automatically — run manually: $HS up -d" >&2
     fi
+    exit "$status"
   fi
-  exit "$status"
 }
 trap on_exit EXIT
 

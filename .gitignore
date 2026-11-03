@@ -4,4 +4,4 @@ secrets.env
 backups/
 .jacky/
 .worktrees/
-server-setup/.check-upstream.lock
+server-setup/.ops.lock

@@ -42,6 +42,7 @@ setup_common() {  # setup_common <dir>
   cp "$SS/bin/backup.sh" "$dir/bin/backup.sh"
   cp "$SS/bin/lib/env.sh" "$dir/bin/lib/env.sh"
   cp "$SS/bin/lib/dump.sh" "$dir/bin/lib/dump.sh"
+  cp "$SS/bin/lib/lock.sh" "$dir/bin/lib/lock.sh"
   chmod +x "$dir/bin/upgrade.sh" "$dir/bin/backup.sh"
 
   cat > "$dir/version.env" <<'EOF'
@@ -171,7 +172,7 @@ rcB=$?
 set -e
 cd "$HERE"
 
-[ "$rcB" -ne 0 ] || { echo "$outB"; echo "FAIL: expected upgrade.sh to exit non-zero after the up -d failure"; exit 1; }
+[ "$rcB" -eq 2 ] || { echo "$outB"; echo "FAIL: expected upgrade.sh to exit 2 (rollback succeeded) after the up -d failure, got $rcB"; exit 1; }
 printf '%s\n' "$outB" | grep -q "AUTO-ROLLBACK OK" || { echo "$outB"; echo "FAIL: missing 'AUTO-ROLLBACK OK'"; exit 1; }
 
 PRE_DUMP_B="$(find "$TB/backups" -maxdepth 1 -name '*-db.sql.gz' | head -1)"
@@ -184,3 +185,55 @@ grep -q '^HINDSIGHT_VERSION=1.1.0$' "$TB/version.env" \
 
 rm -rf "$TB"
 echo "ok - upgrade.sh --auto-rollback restores the exact pre-upgrade dump and the old version"
+
+# ============================================================================
+# Scenario C: --auto-rollback where the rollback ITSELF fails (fake
+# restore-db.sh exits non-zero). Must exit 3 (distinct from the exit-2
+# "rollback succeeded" case) and must never claim "AUTO-ROLLBACK OK".
+# ============================================================================
+TC="$(mktemp -d)"
+setup_common "$TC"
+
+HS_LOG_C="$TC/hs.log"
+: > "$HS_LOG_C"
+
+cat > "$TC/bin/restore-db.sh" <<'EOF'
+#!/bin/sh
+echo "fake restore-db.sh: trial import failed" >&2
+exit 1
+EOF
+chmod +x "$TC/bin/restore-db.sh"
+
+cat > "$TC/bin/hs" <<EOF
+#!/bin/sh
+echo "\$*" >> "$HS_LOG_C"
+case "\$1" in
+  pull) exit 0 ;;
+  stop) exit 0 ;;
+  ps) exit 0 ;;
+  exec)
+    shift
+    case "\$*" in
+      *pg_dump*) cat "$TC/fixture.sql" ;;
+    esac
+    exit 0 ;;
+  up) exit 1 ;;  # new version never comes up -> triggers rollback
+  ready) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$TC/bin/hs"
+
+cd "$TC"
+set +e
+outC="$(PATH="$TC/bin:$PATH" ./bin/upgrade.sh --yes --auto-rollback 1.1.1 </dev/null 2>&1)"
+rcC=$?
+set -e
+cd "$HERE"
+
+[ "$rcC" -eq 3 ] || { echo "$outC"; echo "FAIL: expected upgrade.sh to exit 3 when the rollback itself fails, got $rcC"; exit 1; }
+printf '%s\n' "$outC" | grep -q "AUTO-ROLLBACK OK" && { echo "$outC"; echo "FAIL: must not claim 'AUTO-ROLLBACK OK' when restore-db.sh failed"; exit 1; }
+printf '%s\n' "$outC" | grep -qi "restore-db.sh failed" || { echo "$outC"; echo "FAIL: missing the rollback-failed error"; exit 1; }
+
+rm -rf "$TC"
+echo "ok - upgrade.sh --auto-rollback exits 3 when the rollback itself fails"

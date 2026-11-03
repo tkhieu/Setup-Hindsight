@@ -13,6 +13,7 @@ mkdir -p "$TMP/bin/lib"
 cp "$SS/bin/restore-db.sh" "$TMP/bin/restore-db.sh"
 cp "$SS/bin/lib/env.sh" "$TMP/bin/lib/env.sh"
 cp "$SS/bin/lib/dump.sh" "$TMP/bin/lib/dump.sh"
+cp "$SS/bin/lib/lock.sh" "$TMP/bin/lib/lock.sh"
 chmod +x "$TMP/bin/restore-db.sh"
 
 LIVE_DB=hindsight_db

@@ -9,10 +9,20 @@
 #   - patch available, upgrade succeeds  -> upgrade.sh called with exactly
 #     "--yes --auto-rollback --smoke <ver>", version.env committed+pushed,
 #     a "Hindsight auto-upgraded..." issue opened
-#   - patch available, upgrade fails     -> no commit/push, a "...failed
-#     (rolled back)" issue opened, exit non-zero
+#   - patch available, upgrade.sh exits 2 (rollback OK) -> no commit/push, a
+#     "...failed (rolled back)" issue opened, exit non-zero
+#   - patch available, upgrade.sh exits 3 (rollback ALSO failed) -> the
+#     louder "...failed AND rollback failed" issue, with the pre-upgrade
+#     dump path and the manual restore command, exit non-zero
+#   - patch available, upgrade succeeds but git push fails -> a "...but
+#     version.env push failed" issue, NOT a rollback, exit non-zero
+#   - a GitHub API error while listing issues (dedupe lookup) -> no issue
+#     created, exit non-zero
+#   - dedupe finds a CLOSED issue on page 2 of the listing -> no duplicate
 #   - GITHUB_ISSUE_TOKEN is never put in any curl argv (always via -K - on
 #     stdin)
+#   - --dry-run creates no file at all, including the shared lock file
+#   - missing python3 -> fails loud, immediately
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +61,8 @@ case "$url" in
     printf '%s\n%s' "${RELEASE_BODY:-}" "${RELEASE_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/labels")
     printf '%s\n%s' "" "${LABEL_STATUS:-201}" ;;
+  *"api.github.com/repos/tkhieu/Setup-Hindsight/issues?"*"page=2"*)
+    printf '%s\n%s' "${ISSUES_LIST_BODY_PAGE2:-[]}" "${ISSUES_LIST_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/issues?"*)
     printf '%s\n%s' "${ISSUES_LIST_BODY:-[]}" "${ISSUES_LIST_STATUS:-200}" ;;
   *"api.github.com/repos/tkhieu/Setup-Hindsight/issues")
@@ -71,6 +83,7 @@ setup_minimal() {  # setup_minimal <dir> <cur-version>
   cp "$SS/bin/check-upstream.sh" "$dir/bin/check-upstream.sh"
   cp "$SS/bin/lib/env.sh" "$dir/bin/lib/env.sh"
   cp "$SS/bin/lib/json.sh" "$dir/bin/lib/json.sh"
+  cp "$SS/bin/lib/lock.sh" "$dir/bin/lib/lock.sh"
   chmod +x "$dir/bin/check-upstream.sh"
   write_fake_curl "$dir/fakebin"
 
@@ -174,7 +187,7 @@ export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_5" \
   ISSUES_LIST_BODY='[{"number":42,"title":"Hindsight 1.2.0 available (manual upgrade)"}]'
 out5="$(run_minimal "$T5")"
 unset RELEASE_BODY CREATED_ISSUE_LOG ISSUES_LIST_BODY
-printf '%s\n' "$out5" | grep -q "already open" || { echo "$out5"; echo "FAIL: expected a 'already open' dedupe message"; exit 1; }
+printf '%s\n' "$out5" | grep -q "already exists" || { echo "$out5"; echo "FAIL: expected an 'already exists' dedupe message"; exit 1; }
 [ -s "$CREATED_ISSUE_LOG_5" ] && { echo "FAIL: a duplicate issue was created despite one already being open:"; cat "$CREATED_ISSUE_LOG_5"; exit 1; }
 rm -rf "$T5"
 echo "ok - duplicate issue is deduped, not recreated"
@@ -193,8 +206,9 @@ unset RELEASE_BODY CREATED_ISSUE_LOG
 printf '%s\n' "$out6" | grep -q '\[dry-run\]' || { echo "$out6"; echo "FAIL: expected '[dry-run]' output"; exit 1; }
 [ -s "$CREATED_ISSUE_LOG_6" ] && { echo "FAIL: --dry-run created an issue:"; cat "$CREATED_ISSUE_LOG_6"; exit 1; }
 grep -q "/issues " "$T6/CURL_ARGV_LOG" && { echo "FAIL: --dry-run made an issues API call:"; cat "$T6/CURL_ARGV_LOG"; exit 1; }
+[ -e "$T6/.ops.lock" ] && { echo "FAIL: --dry-run created the shared lock file (must skip locking entirely)"; exit 1; }
 rm -rf "$T6"
-echo "ok - --dry-run makes no upgrade/issue/git calls"
+echo "ok - --dry-run makes no upgrade/issue/git calls and creates no files at all"
 
 # ============================================================================
 # Scenario: GITHUB_ISSUE_TOKEN is never put in curl's argv.
@@ -235,6 +249,7 @@ setup_git() {  # setup_git <dir> <cur-version>
   cp "$SS/bin/check-upstream.sh" "$repo/server-setup/bin/check-upstream.sh"
   cp "$SS/bin/lib/env.sh" "$repo/server-setup/bin/lib/env.sh"
   cp "$SS/bin/lib/json.sh" "$repo/server-setup/bin/lib/json.sh"
+  cp "$SS/bin/lib/lock.sh" "$repo/server-setup/bin/lib/lock.sh"
   chmod +x "$repo/server-setup/bin/check-upstream.sh"
   write_fake_curl "$dir/fakebin"
 
@@ -244,7 +259,7 @@ setup_git() {  # setup_git <dir> <cur-version>
   # Mirrors the real repo's top-level .gitignore: the lock file
   # check-upstream.sh creates must never make git_ready_for_autoupgrade see
   # a dirty working tree on every single run.
-  printf 'server-setup/.check-upstream.lock\n' > "$repo/.gitignore"
+  printf 'server-setup/.ops.lock\n' > "$repo/.gitignore"
   : > "$dir/CURL_ARGV_LOG"
 
   git -C "$repo" add -A
@@ -313,8 +328,9 @@ rm -rf "$T8"
 echo "ok - patch upgrade succeeds: upgrade.sh flags, commit+push, success issue"
 
 # ============================================================================
-# Scenario: patch available, upgrade FAILS -> no commit/push, a "...failed
-# (rolled back)" issue opened, exit non-zero.
+# Scenario: patch available, upgrade.sh exits 2 (upgrade failed but its own
+# --auto-rollback succeeded) -> no commit/push, a "...failed (rolled back)"
+# issue opened, exit non-zero.
 # ============================================================================
 T9="$(mktemp -d)"
 setup_git "$T9" 1.1.0
@@ -326,7 +342,8 @@ cat > "$T9/repo/server-setup/bin/upgrade.sh" <<EOF
 #!/bin/sh
 echo "\$*" >> "$UPGRADE_LOG_9"
 echo "fake upgrade.sh: NOT ready after 5 minutes" >&2
-exit 1
+echo "AUTO-ROLLBACK OK — hindsight is back on 1.1.0 and healthy." >&2
+exit 2
 EOF
 chmod +x "$T9/repo/server-setup/bin/upgrade.sh"
 git -C "$T9/repo" add -A
@@ -342,7 +359,7 @@ rc9=$?
 set -e
 unset RELEASE_BODY CREATED_ISSUE_LOG
 
-[ "$rc9" -ne 0 ] || { echo "$out9"; echo "FAIL: expected a non-zero exit when upgrade.sh fails"; exit 1; }
+[ "$rc9" -eq 1 ] || { echo "$out9"; echo "FAIL: expected check-upstream.sh to exit 1, got $rc9"; exit 1; }
 [ "$(git -C "$T9/repo" rev-parse main)" = "$BEFORE_SHA_9" ] \
   || { echo "FAIL: a commit was made on main despite upgrade.sh failing"; exit 1; }
 grep -q '"title":"Hindsight auto-upgrade to 1.1.1 failed (rolled back)"' "$CREATED_ISSUE_LOG_9" \
@@ -351,4 +368,195 @@ grep -q "NOT ready after 5 minutes" "$CREATED_ISSUE_LOG_9" \
   || { echo "FAIL: expected the upgrade.sh log tail inside the failure issue body"; exit 1; }
 
 rm -rf "$T9"
-echo "ok - patch upgrade fails: no commit/push, failure issue with log tail, non-zero exit"
+echo "ok - upgrade.sh exit 2 (rolled back OK): no commit/push, failure issue with log tail, non-zero exit"
+
+# ============================================================================
+# Scenario: patch available, upgrade.sh exits 3 (upgrade failed AND its own
+# --auto-rollback ALSO failed) -> the louder issue, with the pre-upgrade
+# dump path and the manual restore command extracted from the log, exit
+# non-zero.
+# ============================================================================
+T10="$(mktemp -d)"
+setup_git "$T10" 1.1.0
+UPGRADE_LOG_10="$T10/upgrade.log"
+CREATED_ISSUE_LOG_10="$T10/created_issue.json"
+: > "$UPGRADE_LOG_10"
+: > "$CREATED_ISSUE_LOG_10"
+cat > "$T10/repo/server-setup/bin/upgrade.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$UPGRADE_LOG_10"
+echo "pre-upgrade dump (hindsight was already stopped when this was taken): $T10/fake-pre-1.1.0.sql.gz"
+echo "NOT ready after 5 minutes. Check: hs logs hindsight" >&2
+echo "ERROR: auto-rollback's restore-db.sh failed — hindsight is left STOPPED. Manual intervention required; pre-upgrade dump: $T10/fake-pre-1.1.0.sql.gz" >&2
+exit 3
+EOF
+chmod +x "$T10/repo/server-setup/bin/upgrade.sh"
+git -C "$T10/repo" add -A
+git -C "$T10/repo" commit -q -m "add fake upgrade.sh"
+git -C "$T10/repo" push -q origin main
+
+BEFORE_SHA_10="$(git -C "$T10/repo" rev-parse main)"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_10"
+set +e
+out10="$(run_git "$T10" 2>&1)"
+rc10=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG
+
+[ "$rc10" -eq 1 ] || { echo "$out10"; echo "FAIL: expected check-upstream.sh to exit 1, got $rc10"; exit 1; }
+[ "$(git -C "$T10/repo" rev-parse main)" = "$BEFORE_SHA_10" ] \
+  || { echo "FAIL: a commit was made on main despite upgrade.sh failing"; exit 1; }
+grep -q '"title":"Hindsight auto-upgrade to 1.1.1 failed AND rollback failed — manual action needed"' "$CREATED_ISSUE_LOG_10" \
+  || { echo "FAIL: missing the loud failed+rollback-failed issue:"; cat "$CREATED_ISSUE_LOG_10"; exit 1; }
+grep -qF "$T10/fake-pre-1.1.0.sql.gz" "$CREATED_ISSUE_LOG_10" \
+  || { echo "FAIL: expected the pre-upgrade dump path inside the issue body:"; cat "$CREATED_ISSUE_LOG_10"; exit 1; }
+grep -q "bin/restore-db.sh --yes --no-start" "$CREATED_ISSUE_LOG_10" \
+  || { echo "FAIL: expected the manual restore command inside the issue body:"; cat "$CREATED_ISSUE_LOG_10"; exit 1; }
+
+rm -rf "$T10"
+echo "ok - upgrade.sh exit 3 (rollback ALSO failed): loud issue with dump path + manual command, non-zero exit"
+
+# ============================================================================
+# Scenario: a GitHub API error while listing issues (the dedupe lookup) ->
+# no issue created, exit non-zero. Reuses the minor-release path.
+# ============================================================================
+T11="$(mktemp -d)"
+setup_minimal "$T11" 1.1.0
+printf 'GITHUB_ISSUE_TOKEN=test-token\n' > "$T11/secrets.env"
+CREATED_ISSUE_LOG_11="$T11/created_issue.json"
+: > "$CREATED_ISSUE_LOG_11"
+RELEASE_BODY="$(rel_json v1.2.0)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_11" ISSUES_LIST_STATUS=500
+set +e
+out11="$(run_minimal "$T11" 2>&1)"
+rc11=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG ISSUES_LIST_STATUS
+
+[ "$rc11" -ne 0 ] || { echo "$out11"; echo "FAIL: expected a non-zero exit when the issue-listing API errors"; exit 1; }
+[ -s "$CREATED_ISSUE_LOG_11" ] && { echo "FAIL: an issue was created despite the dedupe lookup failing:"; cat "$CREATED_ISSUE_LOG_11"; exit 1; }
+printf '%s\n' "$out11" | grep -qi "listing.*issues.*failed" \
+  || { echo "$out11"; echo "FAIL: expected a clear 'listing issues failed' error"; exit 1; }
+rm -rf "$T11"
+echo "ok - API error on issue listing -> no issue created, non-zero exit"
+
+# ============================================================================
+# Scenario: dedupe finds a CLOSED issue on page 2 of the listing -> no
+# duplicate created. Page 1 is a full 100-item page of non-matching issues
+# (forces find_issue_by_title to continue to page 2); page 2 has the one
+# matching issue, closed.
+# ============================================================================
+T12="$(mktemp -d)"
+setup_minimal "$T12" 1.1.0
+printf 'GITHUB_ISSUE_TOKEN=test-token\n' > "$T12/secrets.env"
+CREATED_ISSUE_LOG_12="$T12/created_issue.json"
+: > "$CREATED_ISSUE_LOG_12"
+
+page1_items=""
+i=1
+while [ "$i" -le 100 ]; do
+  page1_items="${page1_items}{\"number\":$i,\"title\":\"filler issue $i\",\"state\":\"open\"},"
+  i=$((i + 1))
+done
+ISSUES_LIST_BODY="[${page1_items%,}]"
+# shellcheck disable=SC2089  # literal JSON, only ever read quoted ("$VAR") by the fake curl below
+ISSUES_LIST_BODY_PAGE2='[{"number":999,"title":"Hindsight 1.2.0 available (manual upgrade)","state":"closed"}]'
+
+RELEASE_BODY="$(rel_json v1.2.0)"
+# shellcheck disable=SC2090  # same: ISSUES_LIST_BODY_PAGE2 is always read quoted, never re-parsed
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_12" ISSUES_LIST_BODY ISSUES_LIST_BODY_PAGE2
+out12="$(run_minimal "$T12")"
+unset RELEASE_BODY CREATED_ISSUE_LOG ISSUES_LIST_BODY ISSUES_LIST_BODY_PAGE2
+
+printf '%s\n' "$out12" | grep -q "issue #999 already exists" \
+  || { echo "$out12"; echo "FAIL: expected the page-2 closed issue #999 to be found and deduped"; exit 1; }
+[ -s "$CREATED_ISSUE_LOG_12" ] && { echo "FAIL: a duplicate issue was created despite a closed match on page 2:"; cat "$CREATED_ISSUE_LOG_12"; exit 1; }
+grep -q "page=2" "$T12/CURL_ARGV_LOG" || { echo "FAIL: expected find_issue_by_title to actually request page 2"; exit 1; }
+rm -rf "$T12"
+echo "ok - dedupe finds a closed issue on page 2 -> no duplicate, even across pagination"
+
+# ============================================================================
+# Scenario: patch available, upgrade succeeds, but the git push afterward
+# FAILS -> a "...but version.env push failed" issue, NOT a rollback
+# (nothing to roll back — hindsight is healthy), exit non-zero. The local
+# commit still lands (git problem only); only the push to origin fails.
+# ============================================================================
+T13="$(mktemp -d)"
+setup_git "$T13" 1.1.0
+UPGRADE_LOG_13="$T13/upgrade.log"
+CREATED_ISSUE_LOG_13="$T13/created_issue.json"
+: > "$UPGRADE_LOG_13"
+: > "$CREATED_ISSUE_LOG_13"
+cat > "$T13/repo/server-setup/bin/upgrade.sh" <<EOF
+#!/bin/sh
+echo "\$*" >> "$UPGRADE_LOG_13"
+sed -i 's|^HINDSIGHT_VERSION=.*|HINDSIGHT_VERSION=1.1.1|' "$T13/repo/server-setup/version.env"
+echo "fake upgrade.sh: ok"
+exit 0
+EOF
+chmod +x "$T13/repo/server-setup/bin/upgrade.sh"
+git -C "$T13/repo" add -A
+git -C "$T13/repo" commit -q -m "add fake upgrade.sh"
+git -C "$T13/repo" push -q origin main
+# Break ONLY the push path: a pre-receive hook on the bare origin that
+# rejects every push. `git fetch origin main` (the git_ready_for_autoupgrade
+# preflight) is a read-only operation and still succeeds against this same
+# origin, so the preflight passes and the run reaches the real commit+push
+# step below — pointing origin at a nonexistent path instead would also
+# break that preflight fetch and never get this far.
+cat > "$T13/origin.git/hooks/pre-receive" <<'HOOKEOF'
+#!/bin/sh
+echo "rejected by pre-receive hook (simulated push failure)" >&2
+exit 1
+HOOKEOF
+chmod +x "$T13/origin.git/hooks/pre-receive"
+
+BEFORE_SHA_13="$(git -C "$T13/repo" rev-parse main)"
+RELEASE_BODY="$(rel_json v1.1.1)"
+export RELEASE_BODY CREATED_ISSUE_LOG="$CREATED_ISSUE_LOG_13"
+set +e
+out13="$(run_git "$T13" 2>&1)"
+rc13=$?
+set -e
+unset RELEASE_BODY CREATED_ISSUE_LOG
+
+[ "$rc13" -ne 0 ] || { echo "$out13"; echo "FAIL: expected a non-zero exit when the push fails"; exit 1; }
+[ "$(git -C "$T13/repo" rev-parse main)" != "$BEFORE_SHA_13" ] \
+  || { echo "FAIL: expected the local commit to still land even though the push failed"; exit 1; }
+grep -q '"title":"Hindsight auto-upgraded to 1.1.1 but version.env push failed"' "$CREATED_ISSUE_LOG_13" \
+  || { echo "FAIL: missing the push-failed issue:"; cat "$CREATED_ISSUE_LOG_13"; exit 1; }
+printf '%s\n' "$out13" "$(cat "$CREATED_ISSUE_LOG_13")" | grep -qi "AUTO-ROLLBACK" \
+  && { echo "FAIL: a push failure after a healthy upgrade must never mention a rollback"; exit 1; }
+rm -rf "$T13"
+echo "ok - upgrade succeeds but push fails: push-failed issue, no rollback, non-zero exit"
+
+# ============================================================================
+# Scenario: python3 missing from PATH -> check-upstream.sh fails loud,
+# immediately (before touching network, lock, or anything else).
+# ============================================================================
+T15="$(mktemp -d)"
+setup_minimal "$T15" 1.1.0
+
+# Build a PATH containing nothing but a symlink to the real bash (needed for
+# the "#!/usr/bin/env bash" shebang to resolve at all) — not a filtered copy
+# of the ambient PATH, which on a system where python3 lives in the same
+# directory as bash itself (e.g. both under /usr/bin) would also remove bash
+# and fail for the wrong reason ("env: 'bash': No such file or directory").
+# `command -v python3` is a bash builtin check that happens before anything
+# else external is invoked, so bash alone is enough to reach and fail it.
+NO_PY3_BASH="$(command -v bash)"
+mkdir -p "$T15/no-py3-bin"
+ln -s "$NO_PY3_BASH" "$T15/no-py3-bin/bash"
+
+set +e
+out15="$(cd "$T15" && PATH="$T15/no-py3-bin" ./bin/check-upstream.sh </dev/null 2>&1)"
+rc15=$?
+set -e
+
+[ "$rc15" -ne 0 ] || { echo "$out15"; echo "FAIL: expected a non-zero exit with python3 unavailable"; exit 1; }
+printf '%s\n' "$out15" | grep -qi "python3 is required" \
+  || { echo "$out15"; echo "FAIL: expected a clear 'python3 is required' message"; exit 1; }
+[ -e "$T15/.ops.lock" ] && { echo "FAIL: the lock file was created despite failing before lock acquisition"; exit 1; }
+rm -rf "$T15"
+echo "ok - missing python3 -> fails loud immediately"

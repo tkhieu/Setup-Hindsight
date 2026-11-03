@@ -21,6 +21,9 @@ cd "$CONFIG_DIR"
 HS="$CONFIG_DIR/bin/hs"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/dump.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/lock.sh"
+acquire_ops_lock "$CONFIG_DIR"
 MODE="${1:?usage: backup-r2.sh 6h|daily|weekly|monthly}"
 
 set -a
