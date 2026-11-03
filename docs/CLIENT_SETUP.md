@@ -41,20 +41,22 @@ và không đưa key vào tham số dòng lệnh:
 
 ```bash
 install -d -m 700 ~/.config/hindsight && (
-  set -e; umask 077
+  umask 077
   F=~/.config/hindsight/client.env
-  touch "$F"; chmod 600 "$F"
-  [ "$(stat -c %a "$F" 2>/dev/null || stat -f %Lp "$F")" = 600 ]   # dừng nếu không đặt được quyền 600
-  K=$(ssh hieu@100.77.187.94 "grep '^HINDSIGHT_API_TENANT_API_KEY=' ~/hindsight/server-setup/secrets.env | cut -d= -f2-")
-  [ -n "$K" ]
-  printf 'HINDSIGHT_URL=https://hindsight-api.hieutk.dev\nHINDSIGHT_API_KEY=%s\n' "$K" > "$F"
-  unset K )
-grep -c '^HINDSIGHT_API_KEY=.' ~/.config/hindsight/client.env   # phải in ra 1
+  touch "$F" && chmod 600 "$F" || exit 1
+  [ "$(stat -c %a "$F" 2>/dev/null || stat -f %Lp "$F")" = 600 ] || exit 1   # dừng nếu không đặt được quyền 600
+  K=$(ssh hieu@100.77.187.94 "grep '^HINDSIGHT_API_TENANT_API_KEY=' ~/hindsight/server-setup/secrets.env | cut -d= -f2-") || exit 1
+  [ -n "$K" ] || exit 1
+  printf 'HINDSIGHT_URL=https://hindsight-api.hieutk.dev\nHINDSIGHT_API_KEY=%s\n' "$K" > "$F" || exit 1
+  unset K ) \
+&& echo "OK: client.env đã ghi key, quyền $(stat -c %a ~/.config/hindsight/client.env 2>/dev/null || stat -f %Lp ~/.config/hindsight/client.env)" \
+|| echo "LỖI: chưa ghi key mới (không đặt được quyền 600 hoặc không lấy được key) — đừng chạy setup với file hiện tại" >&2
 ```
 
 Lệnh này ghi đè `client.env` nếu file đã có, đặt quyền `600` trước khi ghi key (kể cả khi file cũ đang mở rộng hơn), và dừng
 lại không ghi gì nếu không đặt được quyền hoặc không lấy được key. Biến môi trường `HINDSIGHT_URL`,
-`HINDSIGHT_API_KEY`, `HINDSIGHT_BANK` (nếu đặt) ghi đè giá trị trong file.
+`HINDSIGHT_API_KEY`, `HINDSIGHT_BANK` ghi đè giá trị trong file khi chúng khác rỗng
+(biến rỗng thì installer dùng giá trị trong file).
 
 **Bank:** mặc định `user-<tên đăng nhập>`, Claude Code và Codex dùng chung. Muốn
 nhiều máy chia sẻ cùng một bộ memory thì thêm cùng một dòng trên mọi máy:
