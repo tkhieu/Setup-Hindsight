@@ -25,6 +25,8 @@
 # --env-file base.env --env-file secrets.env` (bin/hs) — later --env-file
 # wins, and all three are available for ${VAR} interpolation below.
 
+name: hindsight
+
 services:
   db:
     image: pgvector/pgvector:pg${HINDSIGHT_DB_VERSION:?set HINDSIGHT_DB_VERSION in version.env}
