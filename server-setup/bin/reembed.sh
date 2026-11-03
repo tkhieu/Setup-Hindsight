@@ -6,6 +6,8 @@ set -euo pipefail
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 # shellcheck disable=SC1091
 . "$CONFIG_DIR/bin/lib/env.sh"
+# shellcheck disable=SC1091
+. "$CONFIG_DIR/bin/lib/lock.sh"
 HS="$CONFIG_DIR/bin/hs"
 YES=0
 case "${1:-}" in
@@ -39,6 +41,13 @@ separate embeddings key present in secrets.env. Do not accept new writes during 
 TXT
   exit 0
 fi
+
+# Hold the shared ops lock (bin/lib/lock.sh) for the WHOLE --yes run —
+# backup, stop, export, rename, import, verify, restart — so
+# check-upstream/upgrade/backup/restore can never start mid re-embed. The
+# nested bin/backup.sh sees HINDSIGHT_OPS_LOCK_HELD and skips re-locking
+# (no deadlock). The dry run above takes no lock and creates no files.
+acquire_ops_lock "$CONFIG_DIR"
 
 [ -f "$CONFIG_DIR/secrets.env" ] || { echo "reembed: secrets.env missing" >&2; exit 1; }
 env_is_blank "$CONFIG_DIR/secrets.env" HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY \

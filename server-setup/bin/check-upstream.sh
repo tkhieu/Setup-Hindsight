@@ -314,8 +314,9 @@ if [ "$cmp" = patch ]; then
   if [ "$DRY_RUN" = 1 ]; then
     echo "[dry-run] would run: bin/upgrade.sh --yes --auto-rollback --smoke $ver"
     echo "[dry-run] on success: commit+push server-setup/version.env, open issue 'Hindsight auto-upgraded to $ver'"
-    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' or '...failed before changing anything (restarted OK)', depending on whether a pre-upgrade dump was ever taken"
-    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3, or push failing after a healthy upgrade): open the matching '...manual action needed' or '...push failed' issue instead"
+    echo "[dry-run] on a VERIFIED failed-and-recovered outcome (exit 2): open 'Hindsight auto-upgrade to $ver failed (rolled back)' (pre-upgrade dump taken), '...failed before changing anything (restarted OK)' (stopped, no dump), or '...not applied; old version verified running' (image pull failed, stack untouched)"
+    echo "[dry-run] on a failed-and-UNVERIFIED outcome (exit 3): open the matching '...manual action needed' issue instead (rollback failed / restart not verified / untouched old version not verified)"
+    echo "[dry-run] after a healthy upgrade: if git commit fails, open 'Hindsight auto-upgraded to $ver but version.env commit failed'; if only the push fails, open '...but version.env push failed'"
     exit 0
   fi
 

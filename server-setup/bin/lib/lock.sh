@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Shared single-instance lock for every script that touches the Hindsight
 # database or app state: bin/backup.sh, bin/backup-r2.sh, bin/restore-db.sh
-# (including --drill), bin/upgrade.sh and bin/check-upstream.sh. Acquiring
+# (including --drill), bin/upgrade.sh, bin/check-upstream.sh and
+# bin/reembed.sh --yes. Acquiring
 # it serializes all of them against each other — a backup can never start
 # mid-restore, a restore can never start mid-upgrade, etc.
 #
