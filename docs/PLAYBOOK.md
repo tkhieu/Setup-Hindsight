@@ -26,11 +26,11 @@ xem `workstation/` (đang làm ở PR khác trong cùng repo) — không lặp l
 
 | Thành phần | Ở đâu | Ghi chú |
 |---|---|---|
-| 2 container | server, project `server-setup` (tên compose project = tên thư mục) | `hindsight` (API :8888 + UI :9999 trong 1 image), `db` (pgvector/pgvector) |
+| 2 container | server, project `hindsight` (`hindsight-hindsight-1`, `hindsight-db-1`) | `hindsight` (API :8888 + UI :9999 trong 1 image), `db` (pgvector/pgvector) |
 | `cloudflared-hindsight` | server, systemd **user** service, binary host (không phải trong Docker) | không cần sudo, có linger |
 | Config | `~/hindsight/server-setup` (git) | = thư mục này |
 | Repo | `github.com/tkhieu/Setup-Hindsight` (private) | |
-| Dữ liệu persistent | volume `pgdata` (Postgres), `hf_cache` (model local), `chatgpt_credentials` (OAuth) | attachment lưu native trong Postgres (BYTEA) |
+| Dữ liệu persistent | volume `hindsight_pgdata` (Postgres), `hindsight_hf_cache` (model local), `hindsight_chatgpt_credentials` (OAuth) | attachment lưu native trong Postgres (BYTEA) |
 
 **Vì sao không cần checkout upstream riêng:** Hindsight không có file
 `docker-compose.yaml` cần sửa tại chỗ như Multica/Omnigent — `compose.yaml`
@@ -86,6 +86,43 @@ Chạy trên server, trong `~/hindsight/server-setup`:
 > ⚠️ **`bin/hs restart` KHÔNG đọc lại env.** Đổi `base.env`/`secrets.env` thì
 > luôn dùng `bin/hs up -d`. Container restart, config cũ giữ nguyên — lỗi im
 > lặng giống hệt Multica (xem RUNBOOK §8 bên đó).
+
+### Đổi tên Compose project từ `server-setup` (một lần)
+
+Chạy sau khi cập nhật repo trên server, **trước** lệnh `bin/hs up -d` đầu
+tiên với compose mới. Project cũ trùng tên với OneAIHub; kiểm tra dry run
+trước, rồi chạy migration có chủ đích:
+
+```bash
+cd ~/hindsight/server-setup
+bin/migrate-project-name.sh --dry-run
+bin/migrate-project-name.sh --yes
+bin/hs ps
+bin/hs ready
+bin/smoke.sh
+bin/restore-db.sh --drill r2:latest
+docker ps --format '{{.Names}}'
+```
+
+Hai container mới phải có tên `hindsight-*`; các container OneAIHub vẫn
+chạy. Script backup DB trước khi dừng đúng hai container cũ, sao chép ba
+volume, chờ `/health`, giữ nguyên volume cũ và network `server-setup_default`.
+**Không bao giờ dùng `--remove-orphans`** với project `server-setup` vì sẽ
+xóa container của OneAIHub.
+
+Nếu cần quay lại: kiểm tra label `com.docker.compose.project.working_dir`
+của `hindsight-db-1` và `hindsight-hindsight-1` trỏ tới thư mục này; chỉ
+`docker stop` rồi `docker rm` đúng hai container đó. Sau đó chạy
+`COMPOSE_PROJECT_NAME=server-setup bin/hs up -d` và
+`COMPOSE_PROJECT_NAME=server-setup bin/hs ready`. Không dùng `compose down`.
+Sau khi đã xác minh bản mới và backup, dọn ba volume cũ bằng đúng lệnh:
+
+```bash
+docker volume rm server-setup_pgdata server-setup_hf_cache server-setup_chatgpt_credentials
+```
+
+Không xóa volume `server-setup_hub-db-data`,
+`server-setup_hub-db-timescale-data` hay network `server-setup_default`.
 
 ---
 
@@ -506,7 +543,7 @@ rồi chạy `bin/smoke.sh`.
 | Retain/recall bị trì hoãn khi hết hạn mức Pro | ChatGPT plan đã hết usage trong chu kỳ | xem ChatGPT Settings → Usage; Hindsight hoãn retain/consolidation rồi thử lại sau 30 phút |
 | Retain/recall lỗi với provider OpenAI | API key sai/hết quota | xem `bin/hs logs hindsight \| grep -i openai` |
 | UI load được nhưng gọi API lỗi 401 | `HINDSIGHT_CP_DATAPLANE_API_KEY` lệch `HINDSIGHT_API_TENANT_API_KEY` | hai biến này PHẢI giống nhau trong `compose.yaml` (đã set cứng — nếu bạn tự sửa compose, đừng tách ra) |
-| Container tạo lại xong, retain đầu tiên chậm hẳn | volume `hf_cache` bị xoá/mount sai, model tải lại từ HuggingFace | `docker volume inspect server-setup_hf_cache`; đừng `docker volume rm` volume này khi không cố ý |
+| Container tạo lại xong, retain đầu tiên chậm hẳn | volume `hf_cache` bị xoá/mount sai, model tải lại từ HuggingFace | `docker volume inspect hindsight_hf_cache`; đừng `docker volume rm` volume này khi không cố ý |
 | Cùng lúc 3 app backup, máy chậm hẳn lúc 01:00-01:35 (giờ local server, xem §5) | Multica/Omnigent/Hindsight timer gần giờ nhau (đã lệch 5-15 phút có chủ đích, nhưng `RandomizedDelaySec` vẫn có thể trùng ngẫu nhiên) | `systemctl --user list-timers` xem giờ chạy thật; không phải lỗi, chỉ là trùng xác suất thấp |
 | `site trả 502/530` | cloudflared chết hoặc container down | `systemctl --user status cloudflared-hindsight` → `bin/hs ps` |
 | Backup R2 fail với `CreateBucket 403` | thiếu `RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true`, hoặc token R2 sai scope | xem §5 |
