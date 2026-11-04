@@ -1,6 +1,6 @@
 # Hindsight trên máy phát triển
 
-Installer dùng tích hợp chính thức `@vectorize-io/hindsight-coding-agents@0.8.2` (bản đi cùng Hindsight server v1.1.0) và tắt tự cập nhật để giữ đúng phiên bản. Tích hợp đăng ký MCP và hooks tự nhớ/tự gọi lại cho Claude Code (user scope) và Codex. Cả hai dùng chung một bank, mặc định `user-<tên đăng nhập>`; đổi `HINDSIGHT_BANK` nếu cần chia sẻ giữa các máy hoặc tách dữ liệu. Mặc định này đơn giản cho một người dùng, nhưng các dự án cùng bank sẽ chia sẻ ký ức.
+Installer dùng tích hợp chính thức `@vectorize-io/hindsight-coding-agents@0.8.5` (mới hơn bản 0.8.4 đi cùng Hindsight server v1.2.0) và tắt tự cập nhật để giữ đúng phiên bản. Tích hợp đăng ký MCP và hooks tự nhớ/tự gọi lại cho Claude Code (user scope) và Codex. Cả hai dùng chung một bank, mặc định `user-<tên đăng nhập>`; đổi `HINDSIGHT_BANK` nếu cần chia sẻ giữa các máy hoặc tách dữ liệu. Mặc định này đơn giản cho một người dùng, nhưng các dự án cùng bank sẽ chia sẻ ký ức.
 
 ## Cài qua marketplace
 

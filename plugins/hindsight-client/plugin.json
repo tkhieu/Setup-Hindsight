@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "hindsight-client",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cài đặt, kiểm tra và gỡ Hindsight self-hosted trên máy phát triển.",
   "author": {
     "name": "tkhieu"

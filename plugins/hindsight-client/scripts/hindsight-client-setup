@@ -6,7 +6,7 @@ plugin_dir=$(dirname "$(dirname "$(readlink -f "$0")")")
 skill_dir=$plugin_dir/skills/setup-hindsight-client
 env_file=$HOME/.config/hindsight/client.env
 official_config=$HOME/.hindsight/coding-agent.json
-package=@vectorize-io/hindsight-coding-agents@0.8.2
+package=@vectorize-io/hindsight-coding-agents@0.8.5
 mode=install
 
 usage() {
