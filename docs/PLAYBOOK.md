@@ -64,6 +64,30 @@ Hai secret khác nhau, đừng nhầm:
   toàn tách biệt. UI dùng chính API key ở trên (qua
   `HINDSIGHT_CP_DATAPLANE_API_KEY`, set giống nhau trong `compose.yaml`) để
   tự gọi API cho chính nó — không phải thứ bạn gõ khi login.
+
+### Audit log
+
+Server mặc định bật audit logging (`HINDSIGHT_API_AUDIT_LOG_ENABLED=true`
+trong `base.env`), ghi lại request + response body của các thao tác ghi
+(retain/recall/reflect, đổi config bank, v.v.) vào bảng `audit_log`. Vì
+chứa cả nội dung request/response, bảng này phình theo lượng dùng — cùng
+Postgres được backup lên R2 (mục 5), nên retention được chặn ở 90 ngày
+(`HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS=90`) thay vì giữ vĩnh viễn; dọn
+dẹp tự động mỗi giờ.
+
+Xem log:
+
+- **UI**: bank → **Configuration → Audit Logging**.
+- **API**:
+  ```sh
+  printf 'header = "Authorization: Bearer %s"\n' "$HINDSIGHT_API_TENANT_API_KEY" \
+    | curl -K - "https://hindsight-api.hieutk.dev/v1/default/banks/<bank_id>/audit-logs"
+  ```
+  (`-K -` đọc header từ stdin, tránh lộ key qua `ps`/argv — xem mục 10.)
+
+Tắt audit cho riêng một bank (giữ bật mặc định ở server) qua UI toggle ở
+trên, hoặc qua config API của bank đó — không cần sửa `base.env`/restart.
+
 ---
 
 ## 3. Lệnh hằng ngày
