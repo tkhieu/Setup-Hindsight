@@ -1,7 +1,7 @@
 {
   "name": "hindsight-client",
   "displayName": "Hindsight Client Setup",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cài đặt, kiểm tra và gỡ Hindsight self-hosted trên máy phát triển.",
   "author": {
     "name": "tkhieu"

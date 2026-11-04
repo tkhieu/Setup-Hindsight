@@ -9,7 +9,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://hindsight-api.hieutk.dev/health
 
 Client gồm plugin `hindsight-client` (skill `setup-hindsight-client` + script
 `hindsight-client-setup`). Script gọi tích hợp chính thức
-`@vectorize-io/hindsight-coding-agents@0.8.2` để đăng ký MCP và hooks cho cả
+`@vectorize-io/hindsight-coding-agents@0.8.5` (mới hơn bản 0.8.4 đi cùng Hindsight server v1.2.0) để đăng ký MCP và hooks cho cả
 Claude Code lẫn Codex. Chi tiết installer: [`workstation/README.md`](../workstation/README.md).
 
 **Yêu cầu trên máy dev:** `npx` (Node.js), `claude`, `codex`, `curl`, Python 3.11+,

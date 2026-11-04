@@ -160,8 +160,8 @@ codex_marketplace=$repo_root/.agents/plugins/marketplace.json
 plugin_dir=$repo_root/plugins/hindsight-client
 jq -e '.name == "setup-hindsight" and .plugins[0].name == "hindsight-client" and .plugins[0].source == "./plugins/hindsight-client"' "$claude_marketplace" >/dev/null || fail 'Claude marketplace manifest'
 jq -e '.name == "setup-hindsight" and .plugins[0].name == "hindsight-client" and .plugins[0].source.path == "./plugins/hindsight-client"' "$codex_marketplace" >/dev/null || fail 'Codex marketplace manifest'
-jq -e '.name == "hindsight-client" and .version == "0.1.0"' "$plugin_dir/.claude-plugin/plugin.json" >/dev/null || fail 'Claude plugin version'
-jq -e '.name == "hindsight-client" and .version == "0.1.0"' "$plugin_dir/plugin.json" >/dev/null || fail 'Codex plugin version'
+jq -e '.name == "hindsight-client" and .version == "0.1.1"' "$plugin_dir/.claude-plugin/plugin.json" >/dev/null || fail 'Claude plugin version'
+jq -e '.name == "hindsight-client" and .version == "0.1.1"' "$plugin_dir/plugin.json" >/dev/null || fail 'Codex plugin version'
 jq -e '.extensions["com.openai"].onboardingSkill == "./skills/setup-hindsight-client/SKILL.md"' "$plugin_dir/plugin.json" >/dev/null || fail 'Codex onboarding path'
 [ -f "$plugin_dir/skills/setup-hindsight-client/SKILL.md" ] || fail 'packaged skill missing'
 [ -x "$plugin_dir/scripts/hindsight-client-setup" ] || fail 'packaged installer missing'
