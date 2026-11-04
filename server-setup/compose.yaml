@@ -70,6 +70,8 @@ services:
       HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL:-text-embedding-3-small}
       HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: ${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}
       HINDSIGHT_API_RERANKER_PROVIDER: ${HINDSIGHT_API_RERANKER_PROVIDER:-rrf}
+      HINDSIGHT_API_AUDIT_LOG_ENABLED: ${HINDSIGHT_API_AUDIT_LOG_ENABLED:-false}
+      HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS: ${HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS:--1}
       # ApiKeyTenantExtension — confirmed in
       # hindsight_api/extensions/builtin/tenant.py. The value is a
       # module:ClassName import path, not a bare class name.
