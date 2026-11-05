@@ -18,6 +18,7 @@ Quyết định đã chốt:
 - LLM provider: mặc định `chatgpt` (gói ChatGPT Pro qua Sign in with ChatGPT);
   đổi `HINDSIGHT_API_LLM_PROVIDER=openai` trong `base.env` và điền
   `HINDSIGHT_API_LLM_API_KEY` trong `server-setup/secrets.env` để quay lại API key.
+- Extracted facts and observations use English via `HINDSIGHT_API_LLM_OUTPUT_LANGUAGE=English` in `server-setup/base.env`.
 - Backup: `pg_dump` lên Cloudflare R2 qua rclone, không mã hoá, script không bao giờ xoá
   (hết hạn do R2 lifecycle rule).
 - Diễn tập restore định kỳ vào DB tạm, không đụng instance đang chạy.
