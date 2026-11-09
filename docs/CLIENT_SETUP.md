@@ -58,12 +58,36 @@ lại không ghi gì nếu không đặt được quyền hoặc không lấy đ
 `HINDSIGHT_API_KEY`, `HINDSIGHT_BANK` ghi đè giá trị trong file khi chúng khác rỗng
 (biến rỗng thì installer dùng giá trị trong file).
 
-**Bank:** mặc định `user-<tên đăng nhập>`, Claude Code và Codex dùng chung. Muốn
-nhiều máy chia sẻ cùng một bộ memory thì thêm cùng một dòng trên mọi máy:
+**Bank:** mặc định `coding-agent::{gitProject}` cho từng repo; Claude Code và Codex
+trong cùng repo dùng chung bank. `gitProject` là tên thư mục của main worktree:
+linked worktree dùng cùng bank với repo gốc. Hai repo có cùng tên thư mục main
+worktree sẽ trùng bank; khi đó đặt tên repo khác nhau hoặc cấu hình bank riêng.
+Muốn dùng lại một bank chung cố định cho mọi repo trên máy, thêm dòng sau rồi chạy lại `install`:
 
 ```bash
 echo 'HINDSIGHT_BANK=user-hieu' >> ~/.config/hindsight/client.env
 ```
+
+Để tra bank cũ trong **một phiên** mà không đổi cấu hình đã cài, tạo bản cấu hình tạm
+bỏ hai khóa chọn bank (file cấu hình có ưu tiên cao hơn biến môi trường), rồi chạy
+Claude Code hoặc Codex với `HINDSIGHT_BANK_ID` và `HINDSIGHT_DYNAMIC_BANK_ID`:
+
+```bash
+tmp=$(mktemp)
+python3 - "$tmp" <<'PY'
+import json, pathlib, sys
+config = json.loads((pathlib.Path.home() / '.hindsight/coding-agent.json').read_text())
+config.pop('bankId', None)
+config.pop('dynamicBankId', None)
+pathlib.Path(sys.argv[1]).write_text(json.dumps(config))
+PY
+HINDSIGHT_CONFIG="$tmp" HINDSIGHT_BANK_ID=user-hieu HINDSIGHT_DYNAMIC_BANK_ID=false codex
+rm -f "$tmp"
+```
+
+Thay `codex` bằng `claude` nếu cần. Xem [`RUNBOOK.md`](RUNBOOK.md) để seed ký ức
+cũ sang bank repo. Installer không tự đổi cấu hình của máy đã cài; chạy lại `install`
+để áp dụng mặc định mới.
 
 ## 3. Chạy setup
 
@@ -95,5 +119,5 @@ Gỡ: `workstation/bin/hindsight-client-setup --uninstall` (giữ lại `client.
 | Cảnh báo `Codex hooks chưa bật` | Thêm `[features]` và `hooks = true` vào `~/.codex/config.toml`, mở phiên Codex mới |
 | `401` | Key sai, hoặc dùng nhầm `HINDSIGHT_CP_ACCESS_KEY`. Làm lại bước 2 |
 | Không kết nối / `/health` lỗi | DNS trên máy dev (thử `resolvectl flush-caches`), Cloudflare Tunnel, hoặc stack trên server — xem PLAYBOOK, mục triệu chứng |
-| Không thấy memory | `HINDSIGHT_BANK` khác nhau giữa các máy; bank chỉ xuất hiện sau khi đã có dữ liệu |
+| Không thấy memory | Kiểm tra tên `gitProject` của main worktree và bank đang dùng; bank chỉ xuất hiện sau khi đã có dữ liệu. Xem [`RUNBOOK.md`](RUNBOOK.md) để seed ký ức cũ |
 | MCP hoặc hook thiếu | Chạy lại `install`; kiểm tra `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.codex/config.toml` |

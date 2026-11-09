@@ -64,7 +64,9 @@ case " $* " in
     mkdir -p "$HOME/.claude" "$HOME/.codex"
     printf '{"hooks": {"SessionStart": []}}\n' > "$HOME/.claude/settings.json"
     printf '{"hooks": {"SessionStart": []}}\n' > "$HOME/.codex/hooks.json"
-    printf '\n[mcp_servers.hindsight]\ncommand = "node"\n' >> "$HOME/.codex/config.toml"
+    if ! grep -Fq '[mcp_servers.hindsight]' "$HOME/.codex/config.toml"; then
+        printf '\n[mcp_servers.hindsight]\ncommand = "node"\n' >> "$HOME/.codex/config.toml"
+    fi
     claude mcp add --scope user hindsight
     codex mcp add hindsight
     ;;
@@ -79,7 +81,7 @@ EOF
 chmod +x "$scratch/bin/"*
 
 export HINDSIGHT_API_KEY='secret-test-key-987'
-export HINDSIGHT_BANK='hieu-memory'
+unset HINDSIGHT_BANK
 
 "$installer" --dry-run > "$scratch/output" 2>&1 || fail 'dry-run exit'
 [ ! -e "$HOME/.config/hindsight/client.env" ] || fail 'dry-run wrote config'
@@ -96,8 +98,12 @@ c = json.load(open(sys.argv[1]))
 assert c['serverMode'] == 'self-hosted'
 assert c['apiUrl'] == 'https://hindsight-api.hieutk.dev'
 assert c['apiToken'] == 'secret-test-key-987'
-assert c['bankId'] == 'hieu-memory'
+assert 'bankId' not in c
+assert c['dynamicBankId'] is True
+assert c['bankIdTemplate'] == 'coding-agent::{gitProject}'
+assert c['retainTags'] == ['project:{gitProject}']
 assert c['autoUpdate'] is False
+print('bank config:', json.dumps({k: c[k] for k in ('dynamicBankId', 'bankIdTemplate', 'retainTags')}))
 PY
 [ -L "$HOME/.claude/skills/setup-hindsight-client" ] || fail 'Claude skill'
 [ -L "$HOME/.codex/skills/setup-hindsight-client" ] || fail 'Codex skill'
@@ -122,6 +128,28 @@ pass 'unchanged reinstall is idempotent'
 "$installer" --status > "$scratch/output" 2>&1 || fail 'status exit'
 ! grep -q "$HINDSIGHT_API_KEY" "$scratch/output" || fail 'status leaked key'
 pass 'status checks connection without printing key'
+
+export HINDSIGHT_BANK='hieu-memory'
+"$installer" install > "$scratch/output" 2>&1 || fail 'shared bank override exit'
+python3 - "$HOME/.hindsight/coding-agent.json" <<'PY' || fail 'shared bank config'
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert c['bankId'] == 'hieu-memory'
+assert c['dynamicBankId'] is False
+assert 'bankIdTemplate' not in c
+assert 'retainTags' not in c
+PY
+unset HINDSIGHT_BANK
+"$installer" install > "$scratch/output" 2>&1 || fail 'restore per-repo default exit'
+python3 - "$HOME/.hindsight/coding-agent.json" <<'PY' || fail 'restored per-repo config'
+import json, sys
+c = json.load(open(sys.argv[1]))
+assert 'bankId' not in c
+assert c['dynamicBankId'] is True
+assert c['bankIdTemplate'] == 'coding-agent::{gitProject}'
+assert c['retainTags'] == ['project:{gitProject}']
+PY
+pass 'shared bank opt-in and return to per-repo default'
 
 export FAKE_CURL_CODE=401
 if "$installer" --status > "$scratch/output" 2>&1; then fail '401 should fail'; fi
@@ -175,4 +203,4 @@ HINDSIGHT_CLIENT_PLUGIN_MODE=1 "$plugin_dir/scripts/hindsight-client-setup" inst
 [ ! -e "$HOME/.codex/skills/setup-hindsight-client" ] || fail 'plugin mode duplicated Codex skill'
 pass 'marketplace script uses packaged skill without duplicate symlinks'
 
-printf '11 test cases passed\n'
+printf '12 test cases passed\n'

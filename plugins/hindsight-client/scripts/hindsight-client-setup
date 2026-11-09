@@ -78,7 +78,7 @@ elif [ "$mode" = install ]; then
 fi
 HINDSIGHT_URL=${env_url:-${HINDSIGHT_URL:-https://hindsight-api.hieutk.dev}}
 HINDSIGHT_API_KEY=${env_key:-${HINDSIGHT_API_KEY:-}}
-HINDSIGHT_BANK=${env_bank:-${HINDSIGHT_BANK:-user-$(id -un)}}
+HINDSIGHT_BANK=${env_bank:-${HINDSIGHT_BANK:-}}
 HINDSIGHT_URL=${HINDSIGHT_URL%/}
 export HINDSIGHT_URL HINDSIGHT_API_KEY HINDSIGHT_BANK
 export HINDSIGHT_CONFIG=$official_config
@@ -87,14 +87,14 @@ if [[ ! "$HINDSIGHT_URL" =~ ^https?://[^[:space:]]+$ ]]; then
     printf 'HINDSIGHT_URL không hợp lệ.\n' >&2
     exit 2
 fi
-if [[ "$HINDSIGHT_BANK" == *$'\n'* || -z "$HINDSIGHT_BANK" ]]; then
+if [[ "$HINDSIGHT_BANK" == *$'\n'* ]]; then
     printf 'HINDSIGHT_BANK không hợp lệ.\n' >&2
     exit 2
 fi
 
 if [ "$mode" = dry-run ]; then
     printf 'Sẽ kiểm tra %s/health và API có xác thực.\n' "$HINDSIGHT_URL"
-    printf 'Sẽ cài %s cho Claude Code và Codex, bank %s.\n' "$package" "$HINDSIGHT_BANK"
+    printf 'Sẽ cài %s cho Claude Code và Codex; bank %s.\n' "$package" "${HINDSIGHT_BANK:-coding-agent::{gitProject} (theo repo)}"
     printf 'Cấu hình: %s; skill: ~/.claude/skills và ~/.codex/skills.\n' "$official_config"
     exit 0
 fi
@@ -141,10 +141,16 @@ import json, os, sys
 try:
     with open(sys.argv[1], encoding='utf-8') as f:
         cfg = json.load(f)
+    bank = os.environ['HINDSIGHT_BANK']
+    bank_ok = (cfg.get('dynamicBankId') is False and cfg.get('bankId') == bank and
+               'bankIdTemplate' not in cfg and 'retainTags' not in cfg) if bank else (
+               cfg.get('dynamicBankId') is True and 'bankId' not in cfg and
+               cfg.get('bankIdTemplate') == 'coding-agent::{gitProject}' and
+               cfg.get('retainTags') == ['project:{gitProject}'])
     ok = (cfg.get('serverMode') == 'self-hosted' and
           cfg.get('apiUrl') == os.environ['HINDSIGHT_URL'] and
           cfg.get('apiToken') == os.environ['HINDSIGHT_API_KEY'] and
-          cfg.get('bankId') == os.environ['HINDSIGHT_BANK'] and
+          bank_ok and
           cfg.get('autoUpdate') is False)
 except (OSError, ValueError):
     ok = False
@@ -171,7 +177,7 @@ PY
 if [ "$mode" = status ]; then
     if configured; then
         warn_codex_hooks
-        printf 'Tích hợp Claude Code và Codex: đã cấu hình; bank %s.\n' "$HINDSIGHT_BANK"
+        printf 'Tích hợp Claude Code và Codex: đã cấu hình; bank %s.\n' "${HINDSIGHT_BANK:-coding-agent::{gitProject} (theo repo)}"
     else
         printf 'Tích hợp chưa đầy đủ; chạy lệnh install.\n' >&2
         exit 1
@@ -234,8 +240,16 @@ except FileNotFoundError:
 if not isinstance(cfg, dict):
     raise SystemExit('Cấu hình Hindsight phải là JSON object.')
 cfg.update(serverMode='self-hosted', apiUrl=os.environ['HINDSIGHT_URL'],
-           apiToken=os.environ['HINDSIGHT_API_KEY'], bankId=os.environ['HINDSIGHT_BANK'],
-           autoUpdate=False)
+           apiToken=os.environ['HINDSIGHT_API_KEY'], autoUpdate=False)
+bank = os.environ['HINDSIGHT_BANK']
+if bank:
+    cfg.update(bankId=bank, dynamicBankId=False)
+    cfg.pop('bankIdTemplate', None)
+    cfg.pop('retainTags', None)
+else:
+    cfg.pop('bankId', None)
+    cfg.update(dynamicBankId=True, bankIdTemplate='coding-agent::{gitProject}',
+               retainTags=['project:{gitProject}'])
 if os.path.exists(path):
     shutil.copy2(path, path + '.hindsight-client-backup')
     os.chmod(path + '.hindsight-client-backup', 0o600)
@@ -272,4 +286,4 @@ if [ "${HINDSIGHT_CLIENT_PLUGIN_MODE-}" != 1 ]; then
         fi
     done
 fi
-printf 'Đã cài Hindsight cho Claude Code và Codex; bank %s.\n' "$HINDSIGHT_BANK"
+printf 'Đã cài Hindsight cho Claude Code và Codex; bank %s.\n' "${HINDSIGHT_BANK:-coding-agent::{gitProject} (theo repo)}"
