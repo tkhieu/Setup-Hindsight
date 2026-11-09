@@ -41,7 +41,6 @@ done
 printf '%s %s\n' "\$method" "\$url" >> "$FAKE_LOG"
 case "\$method \$url" in
   "GET "*"/banks/coding-agent::repo/stats") printf '{}\n200\n' ;;
-  "GET "*"/banks/user-hieu/documents?q=gitlog%3Arepo"*) printf '{"items":[{"id":"gitlog:repo"}],"total":1,"limit":5,"offset":0}\n200\n' ;;
   "GET "*"/banks/user-hieu/documents?tags=source%3Achat"*"offset=0")
     printf '{"items":[{"id":"conversation:$SID","document_metadata":{"session_id":"$SID"}}],"total":1,"limit":200,"offset":0}\n200\n' ;;
   "POST "*"/banks/user-hieu/document-transfer/export"*) printf '{"detail":"export endpoint removed"}\n500\n' ;;
@@ -68,14 +67,20 @@ grep -q '^POST .*/banks/user-hieu/reflect$' "$FAKE_LOG" || { echo "FAIL: reflect
 grep -q '^POST .*/banks/coding-agent::repo/memories$' "$FAKE_LOG" || { echo "FAIL: retain was not called despite the transfer failure"; exit 1; }
 
 [ -f "$TMP/ledger.jsonl" ] || { echo "FAIL: ledger was not written"; exit 1; }
+[ "$(wc -l < "$TMP/ledger.jsonl")" -eq 2 ] || { echo "FAIL: expected exactly 2 ledger lines (transfer+distill)"; cat "$TMP/ledger.jsonl"; exit 1; }
 python3 -I -c "
 import json
-rec = json.loads(open('$TMP/ledger.jsonl').readline())
-assert rec['transfer_status'] == 'skipped', rec
-assert rec['transferred_count'] == 0, rec
-assert rec['pending_bank'] is None, rec
-assert rec['pending_operation_id'] is None, rec
-assert rec['distill_document_id'] == 'migrated:user-hieu:repo', rec
+lines = [json.loads(l) for l in open('$TMP/ledger.jsonl')]
+transfer = lines[0]
+assert transfer['stage'] == 'transfer', transfer
+assert transfer['transfer_status'] == 'skipped', transfer
+assert transfer['transferred_count'] == 0, transfer
+assert transfer['pending_bank'] is None, transfer
+assert transfer['pending_operation_id'] is None, transfer
+
+distill = lines[1]
+assert distill['stage'] == 'distill', distill
+assert distill['distill_document_id'] == 'migrated:user-hieu:repo', distill
 "
 
 echo "ok - a failed document-transfer falls back to distill-only and records the skip"

@@ -78,10 +78,22 @@ server-setup/bin/seed-repo-bank.sh <repo-basename>              # chạy thật
 `<repo-basename>` là tên thư mục của **main worktree** (không phải tên một
 linked worktree) — đúng tên repo bạn thấy trong `coding-agent::<repo>`.
 
-Ví dụ thật (dry-run cho repo pilot `Setup-Hindsight`, lúc viết runbook này
-— sau khi phase 2 đã bật — bank đích đã tồn tại, document
-`gitlog:Setup-Hindsight` chưa có ở bank đích, chưa có hội thoại nào map được
-qua transcript cục bộ cho repo này):
+**Danh sách "Transfer candidates" chỉ gồm document hội thoại
+(`conversation:<session_id>`) — `gitlog:<repo>` không bao giờ nằm trong đó.**
+Chính plugin coding-agent tự tạo và tự làm mới `gitlog:<repo>` (và trang
+survey-baseline) trong bất kỳ bank nào nó quản lý — xác nhận bằng cách đọc
+mã nguồn plugin thật (`~/.hindsight/coding-agents/dist/*.js`, hàm
+`gitLogIsCurrent`/`GITLOG_HEAD` trong `src/core/git.ts`): nó tự kiểm tra và
+tự "deepen" lại `gitlog:<repo>` ở bank đang dùng, không quan tâm bank đó đã
+có gì sẵn. Script này chép document đó vào cũng là ghi vào đúng một
+document_id mà **plugin coi là của nó** — tạo ra một cuộc giành quyền ghi
+(ownership race) không cần thiết. Document hội thoại thì không có chủ nào
+khác: id của nó gắn với một session đã kết thúc từ trước, không ai (kể cả
+plugin) có thể tạo lại đúng id đó.
+
+Ví dụ thật (dry-run cho repo pilot `Setup-Hindsight`, lúc viết runbook này —
+sau khi phase 2 đã bật — bank đích đã tồn tại, chưa có hội thoại nào map
+được qua transcript cục bộ cho repo này):
 
 ```
 $ server-setup/bin/seed-repo-bank.sh Setup-Hindsight --dry-run
@@ -91,8 +103,8 @@ DRY RUN -- no API writes, no ledger write.
 
 Destination bank status: exists
 
-Transfer candidates (1):
-  gitlog:Setup-Hindsight
+Transfer candidates (0) -- conversation documents only, gitlog:Setup-Hindsight is never transferred:
+  (none found)
 
 Reflect query (against user-hieu):
   ...
@@ -103,19 +115,20 @@ Ledger (not written): .../server-setup/state/bank-seed-ledger.jsonl
 ```
 
 Dry-run chỉ đọc (không cần cân nhắc an toàn): kiểm tra bank đích có tồn tại
-chưa, tìm document `gitlog:<repo>` và các hội thoại map được qua transcript
-cục bộ, kiểm tra trong số đó cái nào **đã có sẵn ở bank đích** (nếu bank đích
-đã tồn tại), dựng câu hỏi `reflect`. Khi có document đã có sẵn ở bank đích,
-dry-run in thêm một dòng liệt kê — những document đó **không bao giờ** được
-tính là "do script này tạo ra" (không tính vào xác nhận đã chép, không nằm
-trong danh sách rollback ở mục 3), vì có thể đã tồn tại từ trước (ví dụ
-chính plugin coding-agent tự ghi `gitlog:<repo>`), không phải do lần chạy
-này.
+chưa, tìm các hội thoại map được qua transcript cục bộ, kiểm tra trong số đó
+cái nào **đã có sẵn ở bank đích** (nếu bank đích đã tồn tại — nghĩa là một
+lần chạy trước đã chép rồi), dựng câu hỏi `reflect`. Khi có document đã có
+sẵn, dry-run in thêm một dòng liệt kê — những document đó **không bao giờ**
+được tính là "do lần chạy này tạo ra" (không tính vào xác nhận đã chép,
+không nằm trong danh sách rollback ở mục 3).
 
-Khi chạy thật, nếu bank đích đã tồn tại, script làm theo thứ tự:
+Khi chạy thật, nếu bank đích đã tồn tại, script làm theo thứ tự — **ghi
+ledger cho bước 1 ngay sau khi biết kết quả, trước khi làm bước 2**, để một
+lần `reflect`/`retain` lỗi ở bước 2 không bao giờ làm mất bản ghi quyền sở
+hữu document của bước 1:
 
-1. **Chép chính xác** từng document trong "Transfer candidates" **chưa có ở
-   bank đích** bằng `document-transfer/export` (bank nguồn) rồi
+1. **Chép chính xác** từng document hội thoại trong "Transfer candidates"
+   **chưa có ở bank đích** bằng `document-transfer/export` (bank nguồn) rồi
    `document-transfer?on_conflict=skip` (bank đích) — hai endpoint này **đã
    deprecated**, chạy bất đồng bộ (trả `operation_id`, script tự poll
    `.../operations/{id}` tối đa `HINDSIGHT_SEED_OPERATION_TIMEOUT` giây,
@@ -129,38 +142,45 @@ Khi chạy thật, nếu bank đích đã tồn tại, script làm theo thứ t�
    của operation** (API tự ghi nhận trường này là nội bộ, có thể đổi dạng
    không báo trước).
 
-   Có 3 kết quả khác nhau, ghi vào ledger qua trường `transfer_status`:
-   - **`transferred`**: operation hoàn tất, ở trên là danh sách document đã
-     xác nhận (`confirmed_document_ids`) — có thể là danh sách rỗng, nếu mọi
+   Khi đang chờ operation, bất kỳ lỗi không dứt khoát nào — timeout, lỗi
+   mạng, `429`, `5xx` — đều **không** bị coi là thất bại; script thử lại cho
+   đến hết `HINDSIGHT_SEED_OPERATION_TIMEOUT`. Chỉ khi **server trả thẳng**
+   `failed`/`cancelled`/`not_found` mới coi là lỗi thật.
+
+   Ghi vào ledger một dòng JSONL riêng (`"stage": "transfer"`) ngay lúc này,
+   với một trong các `transfer_status`:
+   - **`transferred`**: operation hoàn tất (hoặc đã đối soát xong từ một lần
+     `pending` trước — xem dưới), kèm danh sách document đã xác nhận
+     (`confirmed_document_ids`) — có thể là danh sách rỗng, nếu mọi
      candidate đều đã có sẵn từ trước.
-   - **`skipped`**: operation lỗi thật (không phải hết thời gian chờ) — ví
-     dụ endpoint deprecated trả lỗi hẳn. Script **không dừng**: bỏ qua bước
-     chép, vẫn tiếp tục bước 2.
-   - **`pending`**: hết `HINDSIGHT_SEED_OPERATION_TIMEOUT` mà operation vẫn
-     chưa xong (chưa `completed`, chưa `failed`) — **kết quả chưa biết, khác
-     hẳn với bị bỏ qua**: operation vẫn có thể hoàn tất ngay sau khi script
-     thôi chờ. Ledger ghi bank + `operation_id` đang chạy; **lần chạy kế
-     tiếp cho cùng repo sẽ tự kiểm tra lại operation đó trước khi làm gì
-     khác** — nếu đã `completed` thì xác nhận danh sách document thật sự có
-     và dùng luôn, không gửi lại export/import mới. Xem mục "Sự cố thường
-     gặp" để biết cách tự kiểm tra operation đó sớm hơn nếu không muốn chờ
-     lần chạy kế tiếp.
+   - **`skipped`**: server trả thẳng lỗi thật (không phải hết thời gian chờ,
+     không phải lỗi mạng/429/5xx). Script **không dừng**: bỏ qua bước chép,
+     vẫn tiếp tục bước 2.
+   - **`pending`**: hết `HINDSIGHT_SEED_OPERATION_TIMEOUT` mà vẫn chưa biết
+     kết quả thật — **khác hẳn với bị bỏ qua**: operation vẫn có thể hoàn
+     tất ngay sau khi script thôi chờ. Ledger ghi bank + `operation_id` +
+     danh sách candidate đã kiểm tra (`attempted_confirmable_ids`). **Lần
+     chạy kế tiếp cho cùng repo (cùng `--source`) sẽ tự kiểm tra lại operation
+     đó trước khi làm gì khác** — nếu đã `completed` thì xác nhận đúng danh
+     sách `attempted_confirmable_ids` đó (không dùng lại
+     pre-existing-check mới của lần chạy này, vì ngay lúc đó document vừa
+     mới xuất hiện, dễ bị coi nhầm là "có từ trước"), ghi dòng ledger mới
+     với `"reconciles": "<operation_id>"` để đánh dấu dòng `pending` cũ đã
+     được giải quyết — **một dòng `pending` chỉ được đối soát đúng một lần**,
+     dòng nào đã có một dòng `reconciles` nó rồi thì các lần chạy sau không
+     xét lại nữa. Xem mục "Sự cố thường gặp" để tự kiểm tra operation đó sớm
+     hơn nếu không muốn chờ lần chạy kế tiếp.
 2. `reflect` trên bank nguồn với một bộ câu hỏi cố định về repo (quyết định +
    lý do, quy ước, kiến trúc/thành phần, việc dở dang, lỗi đã gặp), chỉ giữ
    thông tin gắn được với repo. Kết quả được `retain` vào bank đích thành
    document `migrated:<bank nguồn>:<repo>`, tag `project:<repo>` và
    `source:migration`, kèm `update_mode: replace` tường minh. Document này
    dùng `document_id` cố định nên **chạy lại luôn thay thế, không nhân bản**.
-3. Ghi một dòng JSONL vào `server-setup/state/bank-seed-ledger.jsonl` (thư
-   mục `state/` không commit — xem `.gitignore`): repo, thời điểm (giờ Việt
-   Nam), bank nguồn/đích, `transfer_status`, `confirmed_document_ids` (danh
-   sách thật — xem mục 1 bước 1), `attempted_confirmable_ids` (danh sách
-   candidate script đã kiểm tra lần này, dùng khi lần chạy sau cần đối soát
-   một operation còn `pending`), `pending_bank`/`pending_operation_id` (khi
-   `transfer_status` là `pending`), `distill_document_id`, `dry_run: false`.
-   Không ghi nội dung memory.
+   Ghi dòng ledger thứ hai (`"stage": "distill"`), riêng với dòng ở bước 1.
 
-Script không bao giờ ghi hoặc xoá bất cứ gì trên **bank nguồn** — chỉ đọc.
+Thư mục `server-setup/state/` không commit (xem `.gitignore`); không dòng
+ledger nào ghi nội dung memory, chỉ repo/counts/ids. Script không bao giờ
+ghi hoặc xoá bất cứ gì trên **bank nguồn** — chỉ đọc.
 
 ## 2. Kiểm tra sau khi chạy thật
 
@@ -180,40 +200,49 @@ printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application
   | curl -sS -K - -X POST -d '{"query":"Repo này có quyết định kiến trúc hay quy ước gì đáng nhớ?"}' \
     "$API/v1/default/banks/$DST/memories/recall"
 
-tail -1 server-setup/state/bank-seed-ledger.jsonl | python3 -m json.tool
+# 2 dòng mới nhất: dòng transfer rồi dòng distill của lần chạy vừa xong
+tail -2 server-setup/state/bank-seed-ledger.jsonl | python3 -c "import sys,json; [print(json.dumps(json.loads(l), indent=2)) for l in sys.stdin]"
 ```
 
-Nếu dòng ledger vừa ghi có `"transfer_status": "pending"`, operation chép
-document chưa xong lúc script thôi chờ — **không phải đã bỏ qua**. Tự kiểm
-tra ngay (không cần chờ lần chạy kế tiếp):
+Nếu dòng ledger `stage: "transfer"` vừa ghi có `"transfer_status": "pending"`,
+chưa biết kết quả thật lúc script thôi chờ — **không phải đã bỏ qua**. Tự
+kiểm tra ngay (không cần chờ lần chạy kế tiếp):
 
 ```bash
 printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" \
   | curl -sS -K - "$API/v1/default/banks/<pending_bank từ ledger>/operations/<pending_operation_id từ ledger>"
 ```
 
-`"status": "completed"` nghĩa là chạy lại script cho repo đó sẽ tự đối soát
-(xác nhận document thật sự có, không gửi lại export/import) — xem mục 1
-bước 1. Còn `"processing"`/`"pending"` thì chờ thêm rồi kiểm tra lại, hoặc cứ
-chạy lại script — đối soát luôn thử trước, không hại gì.
+`"status": "completed"` nghĩa là chạy lại script cho repo đó (với cùng
+`--source`) sẽ tự đối soát (xác nhận đúng `attempted_confirmable_ids` của
+dòng `pending` đó thật sự có, không gửi lại export/import, và ghi dòng mới
+với `"reconciles"` chỉ đúng dòng `pending` này — không đối soát lại lần
+thứ hai) — xem mục 1 bước 1. Còn `"processing"`/`"pending"` thì chờ thêm rồi
+kiểm tra lại, hoặc cứ chạy lại script — đối soát luôn thử trước, không hại
+gì.
 
 Chạy lại script lần 2 cho cùng repo rồi lặp lại bước đếm document: số
 document bank đích **không tăng thêm** vì phần "chép chính xác" dùng
-`on_conflict=skip` và dòng ledger thứ hai sẽ có `confirmed_document_ids`
-rỗng (không có gì MỚI để xác nhận — lần đầu đã xác nhận rồi) — đây là cách
-xác nhận idempotent trên bank thật; ledger ghi đúng những gì đã xảy ra, chứ
-không phải nguồn đếm chính (đếm chính luôn là `GET .../stats` ở trên).
+`on_conflict=skip` và dòng ledger `transfer` thứ hai sẽ có
+`confirmed_document_ids` rỗng (không có gì MỚI để xác nhận — lần đầu đã xác
+nhận rồi) — đây là cách xác nhận idempotent trên bank thật; ledger ghi đúng
+những gì đã xảy ra, chứ không phải nguồn đếm chính (đếm chính luôn là
+`GET .../stats` ở trên).
 
 ## 3. Rollback (chỉ ở bank đích, không đụng bank nguồn)
 
 **Dùng đúng danh sách ledger đã ghi, không tự suy ra lại bằng `--dry-run`.**
 `--dry-run` cho danh sách *candidate* (mọi document có khả năng liên quan
-đến repo), không phải danh sách *đã thật sự được script này tạo ra* — một
-candidate có thể đã tồn tại ở bank đích từ trước (ví dụ `gitlog:<repo>` do
-chính plugin coding-agent tự ghi, không phải do `seed-repo-bank.sh`), và
-xoá nhầm document đó là xoá nhầm dữ liệu không thuộc về lần seed này. Ledger
-đã phân biệt đúng việc này — lấy từ `confirmed_document_ids` của (các) dòng
-ledger liên quan đến repo đó:
+đến repo), không phải danh sách *đã thật sự được script này tạo ra* trong
+bank đích — xoá theo danh sách candidate là xoá nhầm dữ liệu không thuộc về
+lần seed nào cả. Ledger đã phân biệt đúng việc này.
+
+Repo có thể đã được seed nhiều lần với `--source` khác nhau (bank đích vẫn
+chỉ có một) — rollback phải thu đúng **mọi** document đã tạo cho repo đó,
+không chỉ từ `--source` mặc định `user-hieu`. Dùng `jq` thu cả hai loại
+document ledger xác nhận đã tạo — distill (`stage: "distill"`, mọi nguồn)
+và transfer đã xác nhận (`stage: "transfer"`, `transfer_status:
+"transferred"`, `confirmed_document_ids`):
 
 ```bash
 CFG=~/.hindsight/coding-agent.json
@@ -222,23 +251,12 @@ API=$(python3 -c "import json;print(json.load(open('$CFG'))['apiUrl'])")
 REPO="<repo-basename>"
 DST="coding-agent::$REPO"
 
-# Toàn bộ document_id ledger xác nhận ĐÃ TẠO cho repo này, qua mọi lần chạy
-# (confirmed_document_ids gộp theo từng dòng; distill_document_id cố định)
-# -- KHÔNG bao gồm bất cứ candidate nào ledger không xác nhận.
-python3 -c "
-import json
-ids = set()
-distill_id = None
-for line in open('server-setup/state/bank-seed-ledger.jsonl'):
-    rec = json.loads(line)
-    if rec['repo'] != '$REPO':
-        continue
-    ids.update(rec.get('confirmed_document_ids') or [])
-    distill_id = rec['distill_document_id']
-if distill_id:
-    ids.add(distill_id)
-print('\n'.join(sorted(ids)))
-" > /tmp/rollback-ids.txt
+jq -r --arg repo "$REPO" '
+  select(.repo == $repo) |
+  if .stage == "distill" then .distill_document_id
+  elif .stage == "transfer" and .transfer_status == "transferred" then (.confirmed_document_ids // [])[]
+  else empty end
+' server-setup/state/bank-seed-ledger.jsonl | sort -u > /tmp/rollback-ids.txt
 cat /tmp/rollback-ids.txt   # xem lại trước khi xoá
 
 while read -r DOC_ID; do
@@ -250,9 +268,10 @@ done < /tmp/rollback-ids.txt
 rm -f /tmp/rollback-ids.txt
 ```
 
-Nếu có dòng ledger `transfer_status: pending` chưa được đối soát (mục 2),
-chạy lại script một lần trước khi rollback để nó tự cập nhật
-`confirmed_document_ids` — tránh rollback dựa trên thông tin còn thiếu.
+Nếu có dòng ledger `stage: "transfer"`, `transfer_status: "pending"` chưa
+được đối soát (mục 2), chạy lại script một lần trước khi rollback để nó tự
+đối soát và ghi dòng `confirmed_document_ids` thật — tránh rollback dựa
+trên thông tin còn thiếu.
 
 Tag `source:migration` (trên document `migrated:*`) là cách lọc riêng
 document chưng cất nếu `reflect` trộn nhầm repo mà chỉ muốn xoá phần đó,
@@ -317,10 +336,50 @@ Chỉ cân nhắc khi **đồng thời**:
 3. bạn xác nhận không còn cần tra trực tiếp `user-hieu` cho việc hiện tại.
 
 Khi đó: đổi mô tả `user-hieu` thành "archive, chỉ đọc" (bank chính nó vẫn
-giữ nguyên — không có bank clone riêng, xem mục 0). **Giữ tối thiểu 90 ngày**
-sau khi nghỉ hưu — tính từ bản backup/R2 gần mốc nghỉ hưu nhất, không phải
-từ lúc viết runbook này — trước khi cân nhắc xoá. Quyết định xoá nằm ngoài
-phạm vi runbook này, làm riêng sau khi đã xác nhận không cần nữa.
+giữ nguyên — không có bank clone riêng, xem mục 0). **Giữ tối thiểu 90 ngày
+tính từ lúc nghỉ hưu** (không phải từ lúc viết runbook này) trước khi cân
+nhắc xoá. Quyết định xoá nằm ngoài phạm vi runbook này, làm riêng sau khi đã
+xác nhận không cần nữa.
+
+**Backup thường kỳ không tự đủ 90 ngày.** Theo `docs/PLAYBOOK.md` mục 4.3,
+lifecycle rule trên bucket R2 hết hạn theo tầng: `db/6h/` **7 ngày**,
+`db/daily/` **30 ngày**, `db/weekly/` **90 ngày** (đúng ngay biên, có thể
+hết hạn cùng ngày tính mốc), chỉ `db/monthly/` mới chắc **"giữ lâu hơn hoặc
+vô thời hạn"**; bản local (`backups/`) chỉ giữ 14 bản gần nhất
+(`docs/PLAYBOOK.md` mục 3, `HINDSIGHT_BACKUP_KEEP`). Không có bản nào trong
+số này **chắc chắn** còn sau 90 ngày trừ `db/monthly/`.
+
+Vì vậy, **ngay lúc nghỉ hưu**, cần một bước riêng: copy bản backup gần nhất
+sang một prefix R2 **không nằm trong bất kỳ lifecycle rule nào** (lifecycle
+rule hiện chỉ áp cho 4 prefix cố định `db/6h|daily|weekly|monthly/` —
+`archive/` không khớp prefix nào trong số đó, nhưng **phải xác nhận lại
+trên Cloudflare dashboard** là bucket chưa có rule mới khớp `archive/` trước
+khi tin điều này, vì cấu hình lifecycle có thể đã đổi từ lúc viết runbook).
+Dùng đúng kỹ thuật `rclone copyto` server-side mà `bin/backup-r2.sh` đã dùng
+cho daily/weekly/monthly (copy giữa hai prefix cùng bucket, không tải lại
+byte nào):
+
+```bash
+# Chạy trên server (~/hindsight/server-setup), SAU KHI xác nhận trên
+# Cloudflare dashboard rằng bucket không có lifecycle rule khớp archive/.
+# Đây là bước ops riêng khi nghỉ hưu user-hieu -- KHÔNG tự chạy lệnh này,
+# để người vận hành (hoặc orchestrator) chạy như một bước ops độc lập.
+# Thao tác hoàn toàn trên R2 (rclone copyto server-side, không tải byte về
+# máy) -- cùng kỹ thuật `newest()` + copyto mà bin/backup-r2.sh đã dùng cho
+# daily/weekly/monthly, không phải file trong backups/ local (tên file local
+# và tên object db/6h/ trên R2 không giống nhau -- backups/ dùng giờ Việt
+# Nam + label, db/6h/ dùng stamp UTC riêng của backup-r2.sh).
+cd ~/hindsight/server-setup
+set -a; . ./base.env; [ -f ./secrets.env ] && . ./secrets.env; set +a
+RCLONE="${RCLONE_BIN:-$HOME/.local/bin/rclone}"
+DEST="r2:$R2_BUCKET"
+SRC="$("$RCLONE" lsf "$DEST/db/6h" --files-only --include '*.sql.gz' | sort | tail -1)"
+[ -n "$SRC" ] || { echo "no db/6h snapshot found on R2" >&2; exit 1; }
+"$RCLONE" copyto "$DEST/db/6h/$SRC" "$DEST/archive/user-hieu-retirement-$SRC"
+```
+
+Mốc 90 ngày tính **từ lúc nghỉ hưu** (ngày chạy copy này), không phải từ
+ngày của file dump được chọn.
 
 ## Sự cố thường gặp
 
@@ -328,8 +387,8 @@ phạm vi runbook này, làm riêng sau khi đã xác nhận không cần nữa.
 |---|---|
 | `destination bank ... does not exist yet` | Bank đích chưa được plugin tạo — mở repo một lần trong Claude Code/Codex rồi chạy lại |
 | `no API token` | Thiếu `HINDSIGHT_API_TOKEN` và không có `apiToken` hợp lệ trong `~/.hindsight/coding-agent.json` |
-| `document-transfer failed; skipping it` | Endpoint deprecated trả lỗi hẳn (không phải hết thời gian chờ) — script vẫn chạy xong phần chưng cất; xem `transfer_status: "skipped"` trong ledger, có thể thử lại sau |
-| `document-transfer outcome unknown ... recorded as pending` | Hết `HINDSIGHT_SEED_OPERATION_TIMEOUT` mà operation chưa xong — **chưa biết kết quả, khác với bị bỏ qua**. Xem mục 2 để tự kiểm tra operation đó, hoặc chạy lại script sau để nó tự đối soát |
-| `Transfer candidates (0)` ở dry-run | Không có `gitlog:<repo>` và không hội thoại nào map được qua transcript cục bộ — bình thường với repo ít hoạt động trước khi bật per-repo; phần chưng cất vẫn chạy khi chạy thật |
-| `(N ... already exist in the destination bank ...)` ở dry-run | Bình thường trên một rerun, hoặc khi bank đích đã có document trùng id từ nguồn khác (ví dụ plugin tự ghi `gitlog:<repo>`) — những document này không bị script này động vào, không tính vào xác nhận hay rollback |
-| Ledger không có dòng mới | Script dừng trước bước ghi ledger (ví dụ bank đích thiếu, hoặc `reflect`/`retain` lỗi) — xem log lỗi stderr |
+| `document-transfer failed; skipping it` | **Server trả thẳng** lỗi (không phải timeout, không phải lỗi mạng/429/5xx — những cái đó thành `pending`) — script vẫn chạy xong phần chưng cất; xem `transfer_status: "skipped"` trong dòng ledger `stage: "transfer"`, có thể thử lại sau |
+| `document-transfer outcome unknown ... recorded as pending` | Hết `HINDSIGHT_SEED_OPERATION_TIMEOUT` mà vẫn chưa biết kết quả thật (timeout, hoặc mọi lần poll đều lỗi mạng/429/5xx) — **khác với bị bỏ qua**. Xem mục 2 để tự kiểm tra operation đó, hoặc chạy lại script (cùng `--source`) sau để nó tự đối soát — đúng một lần, không đối soát lại dòng đã có `reconciles` trỏ tới |
+| `Transfer candidates (0)` ở dry-run | Không hội thoại nào map được qua transcript cục bộ cho repo này — bình thường với repo ít hoạt động trước khi bật per-repo. `gitlog:<repo>` không bao giờ là candidate (mục 1) nên không tính ở đây; phần chưng cất vẫn chạy khi chạy thật |
+| `(N ... already exist in the destination bank ...)` ở dry-run | Bình thường trên một rerun (một lần chạy trước đã chép những document đó) — không tính vào xác nhận hay rollback của lần chạy này |
+| Ledger không có dòng mới | Script dừng trước khi ghi được dòng `transfer` đầu tiên (ví dụ bank đích thiếu, hoặc lỗi liệt kê document nguồn) — xem log lỗi stderr. Nếu đã có dòng `transfer` nhưng không có dòng `distill` theo sau, `reflect`/`retain` đã lỗi — dòng `transfer` vẫn giữ nguyên, không bị mất |

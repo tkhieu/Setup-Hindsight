@@ -1,8 +1,10 @@
 #!/bin/sh
 # bin/seed-repo-bank.sh --dry-run must perform only read-only discovery
-# (bank existence, gitlog doc lookup, conversation-document listing) and
-# write nothing: no document-transfer/reflect/retain POST, no ledger file.
-# It must also report the exact transfer-candidate set it found.
+# (bank existence, conversation-document listing) and write nothing: no
+# document-transfer/reflect/retain POST, no ledger file. It must also
+# report the exact transfer-candidate set it found -- conversation
+# documents only, gitlog:<repo> is never a candidate (the coding-agent
+# plugin owns and refreshes that document itself).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -47,7 +49,6 @@ done
 printf '%s %s\n' "\$method" "\$url" >> "$FAKE_LOG"
 case "\$method \$url" in
   "GET "*"/banks/coding-agent::repo/stats") printf '{}\n200\n' ;;
-  "GET "*"/banks/user-hieu/documents?q=gitlog%3Arepo"*) printf '{"items":[{"id":"gitlog:repo"}],"total":1,"limit":5,"offset":0}\n200\n' ;;
   "GET "*"/banks/user-hieu/documents?tags=source%3Achat"*"offset=0")
     printf '{"items":[{"id":"conversation:$MATCHED_SID","document_metadata":{"session_id":"$MATCHED_SID"}},{"id":"conversation:$OTHER_SID","document_metadata":{"session_id":"$OTHER_SID"}}],"total":2,"limit":200,"offset":0}\n200\n' ;;
   "GET "*"/banks/coding-agent::repo/documents?q="*)
@@ -67,11 +68,17 @@ export HINDSIGHT_SEED_LEDGER_FILE="$TMP/ledger.jsonl"
 out="$("$TMP/server-setup/bin/seed-repo-bank.sh" repo --dry-run)"
 
 printf '%s\n' "$out" | grep -q 'DRY RUN' || { echo "$out"; echo "FAIL: missing DRY RUN marker"; exit 1; }
-printf '%s\n' "$out" | grep -q 'Transfer candidates (2)' || { echo "$out"; echo "FAIL: expected 2 transfer candidates"; exit 1; }
-printf '%s\n' "$out" | grep -q 'gitlog:repo' || { echo "$out"; echo "FAIL: missing gitlog:repo in plan"; exit 1; }
+printf '%s\n' "$out" | grep -q 'Transfer candidates (1)' || { echo "$out"; echo "FAIL: expected 1 transfer candidate"; exit 1; }
 printf '%s\n' "$out" | grep -q "conversation:$MATCHED_SID" || { echo "$out"; echo "FAIL: missing mapped conversation in plan"; exit 1; }
 if printf '%s\n' "$out" | grep -q "conversation:$OTHER_SID"; then
   echo "$out"; echo "FAIL: untracked-session conversation must not appear in the plan"; exit 1
+fi
+# "gitlog:repo" legitimately appears in the descriptive header text
+# ("... gitlog:repo is never transferred"); only a line that is just the
+# candidate itself, indented exactly like the other listed candidates,
+# would mean it was actually listed.
+if printf '%s\n' "$out" | grep -qx '  gitlog:repo'; then
+  echo "$out"; echo "FAIL: gitlog:repo must never be listed as a transfer candidate"; exit 1
 fi
 
 [ -e "$TMP/ledger.jsonl" ] && { echo "FAIL: dry-run must not write the ledger"; exit 1; }
