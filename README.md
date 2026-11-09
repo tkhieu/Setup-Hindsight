@@ -9,6 +9,7 @@ khuôn của `Setup-Omnigent` / `Setup-Multica`.
 | `docs/PLAYBOOK.md` | vận hành: cài lần đầu, lệnh hằng ngày, upgrade/rollback, backup, diễn tập restore, sự cố |
 | `server-setup/` | compose override, env, script (`bin/`), systemd timer, cloudflared |
 | `docs/CLIENT_SETUP.md` | nối Claude Code và Codex trên máy dev vào Hindsight (cài plugin, tạo `client.env`, chạy setup) |
+| `docs/RUNBOOK.md` | seed bank riêng theo repo từ bank chung `user-hieu` (`bin/seed-repo-bank.sh`): quy trình chạy tay, kiểm tra, rollback |
 | `plugins/hindsight-client/` | plugin marketplace cho Claude Code và Codex: skill + installer |
 | `workstation/` | wrapper chạy installer từ bản checkout, test |
 
