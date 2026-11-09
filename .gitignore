@@ -5,3 +5,4 @@ backups/
 .jacky/
 .worktrees/
 server-setup/.ops.lock
+server-setup/state/
