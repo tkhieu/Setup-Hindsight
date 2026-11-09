@@ -62,15 +62,29 @@ if payload.get("id") == want:
 # directory <cwd> belongs to and returns 0; returns 1 if <cwd> no longer
 # exists on disk or isn't inside a git repo. `git rev-parse --git-common-dir`
 # resolves a linked worktree back to the main repo's .git directory, so a
-# session run from a worktree still maps to the main checkout's name.
+# session run from a worktree still maps to the main checkout's name; it is
+# always absolute for a worktree, but for a plain repo it can be relative
+# *to <cwd>* and contain ".." when <cwd> is a nested subdirectory (e.g.
+# "../../.git"), which a literal "$cwd/$common_dir" string join would get
+# wrong -- dirname() on an unresolved ".." does not walk back up for real.
 repo_basename_for_cwd() {
-  local cwd="$1" common_dir
+  local cwd="$1" common_dir abs
   [ -d "$cwd" ] || return 1
-  common_dir="$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)" || return 1
-  case "$common_dir" in
-    /*) ;;
-    *) common_dir="$cwd/$common_dir" ;;
-  esac
+
+  # git >= 2.31: always absolute, no ".." to resolve.
+  common_dir="$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  if [ -z "$common_dir" ]; then
+    common_dir="$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    case "$common_dir" in
+      /*) ;;
+      *)
+        abs="$(cd "$cwd/$(dirname "$common_dir")" 2>/dev/null && pwd -P)" || return 1
+        common_dir="$abs/$(basename "$common_dir")"
+        ;;
+    esac
+  fi
+
+  [ -n "$common_dir" ] || return 1
   basename "$(dirname "$common_dir")"
 }
 

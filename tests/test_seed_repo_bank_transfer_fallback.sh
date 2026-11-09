@@ -1,8 +1,9 @@
 #!/bin/sh
-# When the (deprecated) document-transfer export call fails, a real run
-# must not abort: it skips the copy step, reports the skip, still runs
-# reflect+retain (distill), and records transfer_skipped=true /
-# transferred_count=0 in the ledger -- never touching the source bank.
+# When the (deprecated) document-transfer export call fails outright (a
+# definite, terminal failure -- not a timeout), a real run must not abort:
+# it skips the copy step, reports the skip, still runs reflect+retain
+# (distill), and records transfer_status="skipped" / transferred_count=0
+# (no pending operation) in the ledger -- never touching the source bank.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -46,6 +47,8 @@ case "\$method \$url" in
   "POST "*"/banks/user-hieu/document-transfer/export"*) printf '{"detail":"export endpoint removed"}\n500\n' ;;
   "POST "*"/banks/user-hieu/reflect") printf '{"text":"Decisions and rationale: none recorded."}\n200\n' ;;
   "POST "*"/banks/coding-agent::repo/memories") printf '{"items_count":1}\n200\n' ;;
+  "GET "*"/banks/coding-agent::repo/documents?q="*)
+    printf '{"items":[],"total":0,"limit":5,"offset":0}\n200\n' ;;
   *) echo "unexpected call: \$method \$url" >&2; printf '{}\n599\n' ;;
 esac
 CURLEOF
@@ -68,8 +71,10 @@ grep -q '^POST .*/banks/coding-agent::repo/memories$' "$FAKE_LOG" || { echo "FAI
 python3 -I -c "
 import json
 rec = json.loads(open('$TMP/ledger.jsonl').readline())
-assert rec['transfer_skipped'] is True, rec
+assert rec['transfer_status'] == 'skipped', rec
 assert rec['transferred_count'] == 0, rec
+assert rec['pending_bank'] is None, rec
+assert rec['pending_operation_id'] is None, rec
 assert rec['distill_document_id'] == 'migrated:user-hieu:repo', rec
 "
 

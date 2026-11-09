@@ -32,6 +32,15 @@
 # path). The API base URL always comes from that same file's "apiUrl". The
 # token is never placed in argv or printed -- it reaches curl only via a
 # `-K -` config file read from stdin, same as bin/smoke.sh.
+#
+# `set +x` runs first and unconditionally, before anything else: xtrace
+# prints each command with its variables already expanded, so a caller (or
+# an inherited SHELLOPTS=xtrace / BASH_ENV) that turned tracing on would
+# otherwise print the token straight out of the `printf '...Bearer %s...'
+# "$AUTH_HEADER_ESCAPED"` calls below -- the one thing the `-K -` stdin
+# convention exists to prevent. This line must stay first.
+set +x
+unset BASH_XTRACEFD
 set -euo pipefail
 
 CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -43,6 +52,21 @@ CONFIG_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 die() { echo "seed-repo-bank: $*" >&2; exit 1; }
 
 usage() { echo "usage: bin/seed-repo-bank.sh <repo-basename> [--dry-run] [--source BANK_ID]" >&2; }
+
+# Every temp file this script creates (document-listing pages, the
+# downloaded transfer ZIP) is tracked here and removed on exit -- success,
+# a `die`, or any other failure path -- not just along the happy path, so
+# --dry-run (and a failing real run) never leaves scratch files behind.
+#
+# Each call site does `f="$(mktemp ...)" && TMP_FILES+=("$f")` as two
+# separate statements -- NOT a `mktemp_tracked` helper that appends to
+# TMP_FILES itself. A helper invoked as `x="$(mktemp_tracked)"` would run
+# inside the command-substitution subshell `$(...)` forks, so its array
+# append would mutate only that subshell's throwaway copy of TMP_FILES and
+# vanish the moment the subshell exits -- the parent shell's TMP_FILES
+# would stay empty and nothing would ever be cleaned up.
+TMP_FILES=()
+trap 'rm -f "${TMP_FILES[@]}"' EXIT
 
 HTTP_TIMEOUT="${HINDSIGHT_SEED_HTTP_TIMEOUT:-60}"
 DOWNLOAD_TIMEOUT="${HINDSIGHT_SEED_DOWNLOAD_TIMEOUT:-180}"
@@ -79,6 +103,11 @@ done
 DST_BANK="coding-agent::$REPO"
 GITLOG_ID="gitlog:$REPO"
 DISTILL_DOC_ID="migrated:$SRC_BANK:$REPO"
+
+# A bank can't be its own migration source: reflect/retain would read and
+# write the same bank, and document-transfer export+import would copy a
+# bank's documents onto themselves.
+[ "$SRC_BANK" != "$DST_BANK" ] || die "--source ($SRC_BANK) must not equal the destination bank ($DST_BANK)"
 
 # ---------------------------------------------------------------------------
 # Config: API URL + token. Token may come from the environment instead of
@@ -168,9 +197,14 @@ bank_exists() {
   esac
 }
 
-# poll_operation <bank> <operation_id> -> prints the final operation JSON and
-# returns 0 once status=completed; returns 1 on failed/cancelled/not_found
-# or once OPERATION_TIMEOUT elapses.
+# poll_operation <bank> <operation_id> -> prints the final operation JSON
+# and returns 0 once status=completed. Returns 1 on a definite, terminal
+# failure (the GET itself failing, or status=failed/cancelled/not_found) --
+# safe to treat as "this did not happen". Returns 2 once OPERATION_TIMEOUT
+# elapses while status is still pending/processing -- the outcome is
+# genuinely unknown (the operation may still complete on the server after
+# this script gives up waiting), so the caller must NOT treat a 2 the same
+# as a 1: it has to be recorded as pending, not skipped.
 poll_operation() {
   local bank="$1" op_id="$2" start status body
   start="$SECONDS"
@@ -182,8 +216,8 @@ poll_operation() {
       failed|cancelled|not_found) echo "seed-repo-bank: operation $op_id ($bank) ended as $status" >&2; return 1 ;;
     esac
     if [ $((SECONDS - start)) -ge "$OPERATION_TIMEOUT" ]; then
-      echo "seed-repo-bank: timed out after ${OPERATION_TIMEOUT}s waiting on operation $op_id ($bank)" >&2
-      return 1
+      echo "seed-repo-bank: operation $op_id ($bank) still $status after ${OPERATION_TIMEOUT}s -- outcome unknown, not retrying further this run" >&2
+      return 2
     fi
     sleep "$POLL_INTERVAL"
   done
@@ -226,17 +260,18 @@ if ! bank_exists "$DST_BANK"; then dst_exists=0; fi
 TRANSFER_IDS=()
 
 gitlog_tmp="$(mktemp)"
+TMP_FILES+=("$gitlog_tmp")
 req GET "$API_URL/v1/default/banks/$SRC_BANK/documents?q=$(urlencode "$GITLOG_ID")&limit=5" > "$gitlog_tmp" \
   || die "could not list documents on source bank $SRC_BANK"
 if [ "$(doc_id_exists "$gitlog_tmp" "$GITLOG_ID")" = 1 ]; then
   TRANSFER_IDS+=("$GITLOG_ID")
 fi
-rm -f "$gitlog_tmp"
 
 conv_offset=0
 tags_qs="tags=$(urlencode "source:chat")&tags_match=any_strict"
 while :; do
   page_tmp="$(mktemp)"
+  TMP_FILES+=("$page_tmp")
   req GET "$API_URL/v1/default/banks/$SRC_BANK/documents?$tags_qs&limit=$PAGE_SIZE&offset=$conv_offset" > "$page_tmp" \
     || die "could not list conversation documents on source bank $SRC_BANK"
   total="$(json_path total < "$page_tmp")"
@@ -252,6 +287,32 @@ while :; do
   conv_offset=$((conv_offset + PAGE_SIZE))
   [ "$conv_offset" -lt "$total" ] || break
 done
+
+# A transfer candidate that already exists in the destination bank (e.g. a
+# gitlog:<repo> the coding-agent plugin wrote there itself, independently
+# of this script) is never ours to claim as "confirmed imported" or later
+# delete on rollback -- on_conflict=skip leaves it untouched either way.
+# CONFIRMABLE_IDS is exactly the subset we can safely attribute to our own
+# transfer once the destination reports it present; checked once here,
+# before any transfer is attempted, specifically so a later presence check
+# can't mistake "was already there" for "we just created this".
+PRE_EXISTING_IN_DST=()
+CONFIRMABLE_IDS=()
+if [ "$dst_exists" = 1 ]; then
+  for id in "${TRANSFER_IDS[@]}"; do
+    chk_tmp="$(mktemp)"
+    TMP_FILES+=("$chk_tmp")
+    req GET "$API_URL/v1/default/banks/$DST_BANK/documents?q=$(urlencode "$id")&limit=5" > "$chk_tmp" \
+      || die "could not list documents on destination bank $DST_BANK"
+    if [ "$(doc_id_exists "$chk_tmp" "$id")" = 1 ]; then
+      PRE_EXISTING_IN_DST+=("$id")
+    else
+      CONFIRMABLE_IDS+=("$id")
+    fi
+  done
+else
+  CONFIRMABLE_IDS=("${TRANSFER_IDS[@]}")
+fi
 
 REFLECT_QUERY=$(cat <<EOF
 You are reviewing everything you have learned so far to extract what you specifically know about the project/repository named "$REPO". Answer only with facts you can confidently attribute to "$REPO" itself; leave out anything about a different repository, and leave out anything too generic to tell apart from other projects. Organize the answer under exactly these five headings, each a short bullet list; if you have nothing repo-specific for a heading, write "None recorded." under it instead of guessing:
@@ -284,6 +345,12 @@ if [ "$DRY_RUN" = 1 ]; then
   else
     printf '  %s\n' "${TRANSFER_IDS[@]}"
   fi
+  if [ "${#PRE_EXISTING_IN_DST[@]}" -gt 0 ]; then
+    echo "  (${#PRE_EXISTING_IN_DST[@]} of these already exist in the destination bank and would be left"
+    echo "   untouched by on_conflict=skip, never recorded as confirmed-imported or rolled back by this script:"
+    printf '     %s\n' "${PRE_EXISTING_IN_DST[@]}"
+    echo "  )"
+  fi
   echo
   echo "Reflect query (against $SRC_BANK):"
   printf '%s\n' "$REFLECT_QUERY" | sed 's/^/  /'
@@ -307,13 +374,22 @@ MSG
   exit 1
 fi
 
-# run_transfer -> prints the reported (or, failing that, attempted) imported
-# document count and returns 0; returns 1 on any failure, at any step, of
-# the (deprecated) document-transfer export/import endpoints. The source
-# bank is only ever read from in this function; the only write is the
+# run_transfer -> on a confirmed-completed import, returns 0 (the caller
+# then calls confirm_imported_ids itself -- this function never trusts
+# result_metadata.documents_imported, since the API's own OpenAPI schema
+# marks result_metadata's shape as internal/unstable). On a definite,
+# terminal failure at any step (exit 1), the caller treats this as "skip
+# the copy, continue with distill". On exit 2 the export or import
+# operation was still pending/processing when OPERATION_TIMEOUT elapsed --
+# the outcome is unknown, NOT a failure, so this prints
+# "<bank>\t<operation_id>" of the operation still in flight; the caller
+# must record that as pending, never as skipped/0, since it may turn out
+# to have succeeded by the time anyone looks again (see
+# reconcile_pending_import, called on the next run). The source bank is
+# only ever read from in this function; the only write is the
 # on_conflict=skip import into the destination bank.
 run_transfer() {
-  local qs id export_body op_id export_op dl_url key tmp_zip import_body import_op imported
+  local qs id export_body op_id export_op poll_rc dl_url key tmp_zip import_body
 
   qs=""
   for id in "${TRANSFER_IDS[@]}"; do
@@ -324,7 +400,9 @@ run_transfer() {
   export_body="$(req POST "$API_URL/v1/default/banks/$SRC_BANK/document-transfer/export?$qs" "")" || return 1
   op_id="$(printf '%s' "$export_body" | json_path operation_id)"
   [ -n "$op_id" ] || return 1
-  export_op="$(poll_operation "$SRC_BANK" "$op_id")" || return 1
+  if export_op="$(poll_operation "$SRC_BANK" "$op_id")"; then poll_rc=0; else poll_rc=$?; fi
+  if [ "$poll_rc" -eq 2 ]; then printf '%s\t%s' "$SRC_BANK" "$op_id"; return 2; fi
+  [ "$poll_rc" -eq 0 ] || return 1
 
   dl_url="$(printf '%s' "$export_op" | json_path result_metadata.download_url)"
   key="$(printf '%s' "$export_op" | json_path result_metadata.storage_key)"
@@ -336,6 +414,7 @@ run_transfer() {
   [ -n "$dl_url" ] || return 1
 
   tmp_zip="$(mktemp "${TMPDIR:-/tmp}/seed-repo-bank.XXXXXX.zip")" || return 1
+  TMP_FILES+=("$tmp_zip")
   req_download "$dl_url" "$tmp_zip" || { rm -f "$tmp_zip"; return 1; }
 
   import_body="$(req_upload "$API_URL/v1/default/banks/$DST_BANK/document-transfer?on_conflict=skip" "$tmp_zip")" \
@@ -343,23 +422,121 @@ run_transfer() {
   rm -f "$tmp_zip"
   op_id="$(printf '%s' "$import_body" | json_path operation_id)"
   [ -n "$op_id" ] || return 1
-  import_op="$(poll_operation "$DST_BANK" "$op_id")" || return 1
-
-  imported="$(printf '%s' "$import_op" | json_path result_metadata.documents_imported)"
-  [ -n "$imported" ] || imported="${#TRANSFER_IDS[@]}"
-  printf '%s' "$imported"
+  if poll_operation "$DST_BANK" "$op_id" >/dev/null; then poll_rc=0; else poll_rc=$?; fi
+  if [ "$poll_rc" -eq 2 ]; then printf '%s\t%s' "$DST_BANK" "$op_id"; return 2; fi
+  [ "$poll_rc" -eq 0 ] || return 1
 }
 
-transfer_count=0
-transfer_skipped=0
-if [ "${#TRANSFER_IDS[@]}" -gt 0 ]; then
-  if transfer_count="$(run_transfer)"; then
-    echo "seed-repo-bank: document-transfer reported $transfer_count imported (of ${#TRANSFER_IDS[@]} requested)"
-  else
-    echo "seed-repo-bank: document-transfer failed or timed out; skipping it and continuing with distill only (source bank untouched)" >&2
-    transfer_skipped=1
-    transfer_count=0
-  fi
+# confirm_imported_ids <id>... -> prints a JSON array of the given ids that
+# now exist in the destination bank. This is the ONLY source of truth this
+# script uses for "what did this run actually create in the destination
+# bank" -- never a count parsed out of an operation's result_metadata.
+# Called with CONFIRMABLE_IDS after run_transfer returns 0 (freshly
+# completed), or with a PREVIOUS run's recorded candidate list from
+# reconcile_pending_import -- deliberately never with the CURRENT run's own
+# CONFIRMABLE_IDS in that second case: by the time a pending operation is
+# reconciled, the documents it just finished creating are already sitting
+# in the destination bank, so a fresh "pre-existing in dst" check run at
+# the very start of THIS invocation (before reconcile even looks at the
+# operation) would wrongly see them as pre-existing and exclude them.
+confirm_imported_ids() {
+  local id tmp found=()
+  for id in "$@"; do
+    tmp="$(mktemp)"
+    TMP_FILES+=("$tmp")
+    req GET "$API_URL/v1/default/banks/$DST_BANK/documents?q=$(urlencode "$id")&limit=5" > "$tmp" \
+      || die "could not list documents on destination bank $DST_BANK while confirming the transfer"
+    if [ "$(doc_id_exists "$tmp" "$id")" = 1 ]; then
+      found+=("$id")
+    fi
+  done
+  python3 -I -c '
+import json, sys
+print(json.dumps(sys.argv[1:]))
+' "${found[@]}"
+}
+
+# reconcile_pending_import -> if the ledger's most recent entry for this
+# repo recorded transfer_status=pending on the DESTINATION bank's import
+# operation (the one that actually determines whether documents landed),
+# check that operation now. On success (exit 0) prints the
+# confirm_imported_ids JSON array -- checked against THAT entry's own
+# recorded attempted_confirmable_ids, not this run's CONFIRMABLE_IDS (see
+# confirm_imported_ids) -- so the caller can skip resubmitting a fresh
+# transfer entirely. Returns 1 if there was nothing to reconcile, the
+# recorded pending operation wasn't the import step, or it still isn't
+# done -- in every one of those cases the caller falls through to a normal
+# run_transfer attempt, which is always safe to retry (on_conflict=skip).
+reconcile_pending_import() {
+  local last_pending bank op_id attempted_json body status attempted_ids=() line
+  [ -f "$LEDGER_FILE" ] || return 1
+  last_pending="$(python3 -I -c '
+import json, sys
+repo = sys.argv[1]
+last = None
+for line in open(sys.argv[2]):
+    line = line.strip()
+    if not line:
+        continue
+    rec = json.loads(line)
+    if rec.get("repo") == repo and rec.get("transfer_status") == "pending":
+        last = rec
+if last is not None:
+    print((last.get("pending_bank") or "") + "\t" + (last.get("pending_operation_id") or "") + "\t"
+          + json.dumps(last.get("attempted_confirmable_ids") or []))
+' "$REPO" "$LEDGER_FILE" 2>/dev/null)" || return 1
+  [ -n "$last_pending" ] || return 1
+  bank="$(printf '%s' "$last_pending" | cut -f1)"
+  op_id="$(printf '%s' "$last_pending" | cut -f2)"
+  attempted_json="$(printf '%s' "$last_pending" | cut -f3)"
+  [ "$bank" = "$DST_BANK" ] && [ -n "$op_id" ] || return 1
+
+  body="$(req GET "$API_URL/v1/default/banks/$bank/operations/$op_id")" || return 1
+  status="$(printf '%s' "$body" | json_path status)"
+  [ "$status" = completed ] || return 1
+  echo "seed-repo-bank: reconciled previously-pending import operation $op_id ($bank)" >&2
+
+  while IFS= read -r line; do attempted_ids+=("$line"); done < <(python3 -I -c '
+import json, sys
+for x in json.loads(sys.argv[1]):
+    print(x)
+' "$attempted_json")
+  confirm_imported_ids "${attempted_ids[@]}"
+}
+
+transfer_status="none"
+confirmed_ids_json="[]"
+pending_bank=""
+pending_op_id=""
+
+if reconciled_json="$(reconcile_pending_import)"; then
+  transfer_status="transferred"
+  confirmed_ids_json="$reconciled_json"
+elif [ "${#TRANSFER_IDS[@]}" -gt 0 ] && [ "${#CONFIRMABLE_IDS[@]}" -eq 0 ]; then
+  # Every candidate already exists in the destination bank -- a common
+  # case on a rerun. Nothing new to confirm, and no reason to hit the
+  # deprecated document-transfer endpoints just to get a no-op skip back.
+  transfer_status="transferred"
+  echo "seed-repo-bank: all ${#TRANSFER_IDS[@]} transfer candidate(s) already exist in the destination bank; nothing new to copy"
+elif [ "${#TRANSFER_IDS[@]}" -gt 0 ]; then
+  if transfer_out="$(run_transfer)"; then transfer_rc=0; else transfer_rc=$?; fi
+  case "$transfer_rc" in
+    0)
+      transfer_status="transferred"
+      confirmed_ids_json="$(confirm_imported_ids "${CONFIRMABLE_IDS[@]}")"
+      echo "seed-repo-bank: document-transfer completed; confirmed imported: $confirmed_ids_json (of ${#TRANSFER_IDS[@]} candidates, ${#PRE_EXISTING_IN_DST[@]} already present)"
+      ;;
+    2)
+      transfer_status="pending"
+      pending_bank="${transfer_out%%$'\t'*}"
+      pending_op_id="${transfer_out#*$'\t'}"
+      echo "seed-repo-bank: document-transfer outcome unknown (operation $pending_op_id on $pending_bank still running after ${OPERATION_TIMEOUT}s) -- recorded as pending, NOT skipped. Re-running this script later will check it and reconcile (docs/RUNBOOK.md)." >&2
+      ;;
+    *)
+      transfer_status="skipped"
+      echo "seed-repo-bank: document-transfer failed; skipping it and continuing with distill only (source bank untouched)" >&2
+      ;;
+  esac
 else
   echo "seed-repo-bank: no gitlog or mapped conversation documents found for $REPO; nothing to transfer"
 fi
@@ -381,6 +558,10 @@ print(json.dumps({
         "document_id": sys.argv[2],
         "tags": ["project:" + sys.argv[3], "source:migration"],
         "timestamp": "unset",
+        # Explicit, not relying on the documented default for retain: a
+        # rerun must replace this one document (delete + reprocess), never
+        # duplicate it, which is exactly what makes this idempotent.
+        "update_mode": "replace",
     }],
     "async": False,
 }))
@@ -389,21 +570,50 @@ req POST "$API_URL/v1/default/banks/$DST_BANK/memories" "$retain_body" > /dev/nu
   || die "retain of distilled document into $DST_BANK failed"
 echo "seed-repo-bank: retained distilled document \"$DISTILL_DOC_ID\" into $DST_BANK"
 
+attempted_confirmable_json="$(python3 -I -c '
+import json, sys
+print(json.dumps(sys.argv[1:]))
+' "${CONFIRMABLE_IDS[@]}")"
+
 mkdir -p "$(dirname "$LEDGER_FILE")"
 ts="$(TZ=Asia/Saigon date -Is)"
 python3 -I -c '
 import json, sys
+confirmed_ids = json.loads(sys.argv[6])
 rec = {
     "repo": sys.argv[1],
     "timestamp": sys.argv[2],
     "source_bank": sys.argv[3],
     "destination_bank": sys.argv[4],
-    "transferred_count": int(sys.argv[5]),
-    "transfer_skipped": sys.argv[6] == "1",
-    "distill_document_id": sys.argv[7],
+    # transfer_status: "transferred" (confirmed_document_ids is the real
+    # list, incl. reconciled), "skipped" (a terminal failure -- safe to
+    # treat as not copied), "pending" (operation still unfinished when we
+    # stopped waiting -- outcome unknown, NOT the same as skipped), or
+    # "none" (nothing to copy).
+    "transfer_status": sys.argv[5],
+    # Exactly what this run (or a later reconcile of it) confirmed present
+    # in the destination bank that was NOT there before -- never a count
+    # trusted from the transfer operation'"'"'s own result_metadata. This is
+    # the list docs/RUNBOOK.md rollback deletes; it never includes a
+    # pre-existing document the destination bank already had (such as a
+    # gitlog:<repo> the coding-agent plugin wrote itself).
+    "confirmed_document_ids": confirmed_ids,
+    "transferred_count": len(confirmed_ids),
+    "pending_bank": sys.argv[7] or None,
+    "pending_operation_id": sys.argv[8] or None,
+    # The candidate set confirm_imported_ids checked THIS run (excluding
+    # anything already present in the destination bank before this run
+    # started). Recorded on every entry, not just "pending" ones, but it
+    # only matters for a later reconcile_pending_import: it checks exactly
+    # these ids, not whatever a future run'"'"'s own fresh pre-existing check
+    # would compute, which by then could wrongly see these as pre-existing
+    # (they would have just landed from the very operation being
+    # reconciled).
+    "attempted_confirmable_ids": json.loads(sys.argv[10]),
+    "distill_document_id": sys.argv[9],
     "dry_run": False,
 }
 print(json.dumps(rec, ensure_ascii=False))
-' "$REPO" "$ts" "$SRC_BANK" "$DST_BANK" "$transfer_count" "$transfer_skipped" "$DISTILL_DOC_ID" >> "$LEDGER_FILE"
+' "$REPO" "$ts" "$SRC_BANK" "$DST_BANK" "$transfer_status" "$confirmed_ids_json" "$pending_bank" "$pending_op_id" "$DISTILL_DOC_ID" "$attempted_confirmable_json" >> "$LEDGER_FILE"
 
 echo "seed-repo-bank: done. Ledger: $LEDGER_FILE"

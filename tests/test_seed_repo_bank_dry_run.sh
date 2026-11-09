@@ -50,6 +50,8 @@ case "\$method \$url" in
   "GET "*"/banks/user-hieu/documents?q=gitlog%3Arepo"*) printf '{"items":[{"id":"gitlog:repo"}],"total":1,"limit":5,"offset":0}\n200\n' ;;
   "GET "*"/banks/user-hieu/documents?tags=source%3Achat"*"offset=0")
     printf '{"items":[{"id":"conversation:$MATCHED_SID","document_metadata":{"session_id":"$MATCHED_SID"}},{"id":"conversation:$OTHER_SID","document_metadata":{"session_id":"$OTHER_SID"}}],"total":2,"limit":200,"offset":0}\n200\n' ;;
+  "GET "*"/banks/coding-agent::repo/documents?q="*)
+    printf '{"items":[],"total":0,"limit":5,"offset":0}\n200\n' ;;
   *) echo "unexpected call: \$method \$url" >&2; printf '{}\n599\n' ;;
 esac
 CURLEOF

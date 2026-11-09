@@ -1,10 +1,17 @@
 #!/bin/sh
 # Running bin/seed-repo-bank.sh twice for the same repo must be idempotent:
-# both runs retain the distilled document under the exact same document_id
-# (migrated:<source>:<repo>), relying on retain's upsert-by-document_id to
-# replace rather than duplicate it, and each run appends exactly one ledger
-# line. Also checks, as the rest of this repo's scripts do, that the API
-# token never reaches curl's argv (only the -K stdin config carries it).
+# both runs' retain payload must carry the exact same document_id
+# (migrated:<source>:<repo>) AND an explicit update_mode="replace" -- not
+# relying on retain's default ever staying "replace" -- so a rerun replaces
+# rather than duplicates it, and each run appends exactly one ledger line.
+# Run 1's candidates are genuinely new, so they end up confirmed; by run 2
+# they are already present in the destination bank, so run 2 must report
+# an empty confirmed_document_ids (nothing NEW -- run 1's ledger entry
+# already owns those ids for rollback purposes) and must skip the
+# deprecated document-transfer export/import entirely rather than
+# submitting one just to get a no-op skip back. Also checks, as the rest
+# of this repo's scripts do, that the API token never reaches curl's argv
+# (only the -K stdin config carries it).
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -58,9 +65,22 @@ case "\$method \$url" in
   "POST "*"/banks/coding-agent::repo/document-transfer?on_conflict=skip")
     printf '{"operation_id":"imp-1","status":"pending"}\n202\n' ;;
   "GET "*"/banks/coding-agent::repo/operations/imp-1")
+    touch "$TMP/import-landed"
     printf '{"operation_id":"imp-1","status":"completed","result_metadata":{"documents_imported":0}}\n200\n' ;;
   "POST "*"/banks/user-hieu/reflect") printf '{"text":"Decisions and rationale: none recorded."}\n200\n' ;;
   "POST "*"/banks/coding-agent::repo/memories") printf '{"items_count":1}\n200\n' ;;
+  "GET "*"/banks/coding-agent::repo/documents?q=gitlog%3Arepo"*)
+    if [ -f "$TMP/import-landed" ]; then
+      printf '{"items":[{"id":"gitlog:repo"}],"total":1,"limit":5,"offset":0}\n200\n'
+    else
+      printf '{"items":[],"total":0,"limit":5,"offset":0}\n200\n'
+    fi ;;
+  "GET "*"/banks/coding-agent::repo/documents?q=conversation%3A$SID"*)
+    if [ -f "$TMP/import-landed" ]; then
+      printf '{"items":[{"id":"conversation:$SID"}],"total":1,"limit":5,"offset":0}\n200\n'
+    else
+      printf '{"items":[],"total":0,"limit":5,"offset":0}\n200\n'
+    fi ;;
   *) echo "unexpected call: \$method \$url" >&2; printf '{}\n599\n' ;;
 esac
 CURLEOF
@@ -82,12 +102,45 @@ printf '%s\n' "$out2" | grep -q 'migrated:user-hieu:repo' || { echo "$out2"; ech
 [ "$(wc -l < "$TMP/ledger.jsonl")" -eq 2 ] || { echo "FAIL: expected exactly 2 ledger lines after 2 runs"; cat "$TMP/ledger.jsonl"; exit 1; }
 python3 -I -c "
 import json
-ids = {json.loads(line)['distill_document_id'] for line in open('$TMP/ledger.jsonl')}
+lines = [json.loads(l) for l in open('$TMP/ledger.jsonl')]
+ids = {rec['distill_document_id'] for rec in lines}
 assert ids == {'migrated:user-hieu:repo'}, ids
+
+# Run 1: both candidates are genuinely new -> confirmed.
+run1 = lines[0]
+assert run1['transfer_status'] == 'transferred', run1
+assert set(run1['confirmed_document_ids']) == {'gitlog:repo', 'conversation:$SID'}, run1
+
+# Run 2: everything is now pre-existing in the destination bank -> nothing
+# NEW to confirm. Idempotent means safe to rerun, not 'always re-claims the
+# same ids' -- run 1's ledger entry already owns them for rollback purposes.
+run2 = lines[1]
+assert run2['transfer_status'] == 'transferred', run2
+assert run2['confirmed_document_ids'] == [], run2
 "
+
+# And specifically because everything was already pre-existing, run 2 must
+# skip the deprecated document-transfer endpoints entirely rather than
+# submitting a pointless export/import just to get a no-op skip back.
+export_calls="$(grep -c '/document-transfer/export' "$FAKE_LOG")"
+[ "$export_calls" -eq 1 ] || { echo "FAIL: expected exactly 1 document-transfer/export call (run 1 only), got $export_calls"; cat "$FAKE_LOG"; exit 1; }
 
 if grep -qF "$API_CANARY" "$FAKE_LOG"; then
   echo "FAIL: API token canary found in curl argv:"; cat "$FAKE_LOG"; exit 1
 fi
 
-echo "ok - rerun retains under the same document_id (idempotent) and never puts the token in argv"
+# Both calls' logged argv must carry the retain payload itself (sent via
+# -d, same as the rest of this repo's scripts send non-secret JSON bodies)
+# with the fixed document_id and an explicit replace update_mode. Each
+# grep stage matches its own substring anywhere on the line, independent
+# of where in the line the other substring falls.
+retain_with_docid="$(grep -F 'banks/coding-agent::repo/memories' "$FAKE_LOG" \
+  | grep -cF '"document_id": "migrated:user-hieu:repo"')" || true
+retain_with_replace="$(grep -F 'banks/coding-agent::repo/memories' "$FAKE_LOG" \
+  | grep -cF '"update_mode": "replace"')" || true
+[ "${retain_with_docid:-0}" -eq 2 ] \
+  || { echo "FAIL: expected both retain calls to carry document_id=migrated:user-hieu:repo, got $retain_with_docid"; cat "$FAKE_LOG"; exit 1; }
+[ "${retain_with_replace:-0}" -eq 2 ] \
+  || { echo "FAIL: expected both retain calls to carry update_mode=replace, got $retain_with_replace"; cat "$FAKE_LOG"; exit 1; }
+
+echo "ok - rerun retains under the same document_id with replace semantics (idempotent), and never puts the token in argv"
