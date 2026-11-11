@@ -15,6 +15,8 @@
 #   - db service not published at all (even the example's commented-out
 #     port line only suggests binding it; not exposing it is stricter and
 #     nothing outside the compose network needs it).
+#   - db gets an explicit shm_size (the example relies on Docker's 64MiB
+#     default) — see the comment on db.shm_size below.
 #
 # Loaded via `docker compose -f compose.yaml --env-file version.env
 # --env-file base.env --env-file secrets.env` (bin/hs) — later --env-file
@@ -26,6 +28,25 @@ services:
   db:
     image: pgvector/pgvector:pg${HINDSIGHT_DB_VERSION:?set HINDSIGHT_DB_VERSION in version.env}
     restart: unless-stopped
+    # Docker's default /dev/shm (64MiB) is NOT enough here — confirmed on
+    # the server (2026-11-11): restoring a ~1.3GB dump via
+    # `bin/restore-db.sh --drill` (the real restore takes the identical
+    # `psql -f -` path, same container, same limit) filled it and Postgres
+    # logged repeated `could not resize shared memory segment ... No space
+    # left on device` (docker logs hindsight-db-1). dynamic_shared_memory_
+    # type=posix here backs parallel workers' DSM segments with /dev/shm,
+    # and max_parallel_maintenance_workers=2 means a single large CREATE
+    # INDEX during restore can want roughly two ~64MB segments at once —
+    # already more than the whole default by itself. 256m covers that with
+    # headroom and is safe on this host's ~5.4GiB RAM: /dev/shm is tmpfs,
+    # so the extra headroom only costs real memory while something
+    # actually fills it (restore/maintenance), not just by being
+    # configured.
+    #
+    # Takes effect only after the container is recreated — `bin/hs up -d
+    # db` (compose detects the config change and recreates; `restart` is
+    # not enough) — see docs/PLAYBOOK.md §6 for the one-time apply step.
+    shm_size: "256m"
     environment:
       POSTGRES_USER: ${HINDSIGHT_DB_USER:-hindsight_user}
       POSTGRES_PASSWORD: ${HINDSIGHT_DB_PASSWORD:?set HINDSIGHT_DB_PASSWORD in secrets.env}
