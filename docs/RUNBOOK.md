@@ -36,6 +36,11 @@ chờ của Cloudflare tunnel trên `https://hindsight-api.hieutk.dev`.
    ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/restore-db.sh --drill r2:db/6h/20261109T031638Z.sql.gz'
    ```
 
+   Lệnh `--drill` ở trên đã từng fail trên chính bản dump này (2026-11-11)
+   vì `/dev/shm` mặc định 64MiB của container `db` không đủ cho restore —
+   xem cảnh báo `shm_size` và cách áp dụng một lần ở `docs/PLAYBOOK.md`
+   mục 6, rồi chạy lại.
+
    **Không bao giờ chạy `POST .../banks/<bank_id>/clone`, và không bao giờ
    chạy `document-transfer`/`transfer` xuất toàn bộ `user-hieu` (export
    không giới hạn `document_id`), trên server này** — cùng nguyên nhân OOM

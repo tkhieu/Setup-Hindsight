@@ -412,6 +412,35 @@ kiểm tra bucket tồn tại trước khi upload → mọi lần ghi fail với
 `bin/restore-db.sh` là **nguồn sự thật duy nhất** cho restore — cả restore
 thật và diễn tập đều đi qua nó.
 
+⚠️ **`db` cần `shm_size: 256m` trong `compose.yaml` (đã có từ bản này) —
+container PHẢI được tạo lại một lần để áp dụng.** Mặc định Docker (64MiB)
+không đủ: thử thật trên server (2026-11-11), `--drill` một bản dump
+~1.3GB bị lỗi `could not resize shared memory segment ... No space left
+on device` (`docker logs hindsight-db-1`) — import thử (bước 5 dưới) và
+restore thật đi qua CÙNG container `db`, cùng giới hạn, nên restore thật
+hỏng y vậy. `dynamic_shared_memory_type=posix` dùng `/dev/shm` cho DSM
+segment của parallel worker; `max_parallel_maintenance_workers=2` nghĩa
+là một `CREATE INDEX` lớn khi restore có thể cần ~2×64MB cùng lúc — đã
+vượt hẳn mặc định 64MiB. `/dev/shm` là tmpfs, 256m chỉ tốn RAM thật lúc
+nó được dùng (restore/maintenance), không tốn gì khi rảnh — an toàn trên
+RAM hạn chế của server này (xem `docs/RUNBOOK.md` §0).
+
+Áp dụng một lần (bắt buộc trước khi tin kết quả `--drill` hay restore thật
+trên server đang chạy — compose đổi `shm_size` không tự áp dụng cho
+container đã tồn tại, `restart` KHÔNG đủ, phải recreate):
+
+```bash
+ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/hs up -d db'
+# xác nhận:
+ssh hieu@100.77.187.94 'docker inspect --format "{{.HostConfig.ShmSize}}" hindsight-db-1'   # phải ra 268435456
+```
+
+Sau đó chạy lại diễn tập để xác nhận đã hết lỗi (xem §7):
+
+```bash
+ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/restore-db.sh --drill backups/20261109-030157-pre-per-repo-pilot-20261109-db.sql.gz'
+```
+
 ```bash
 bin/restore-db.sh r2:latest              # bản 6h mới nhất trên R2
 bin/restore-db.sh r2:latest:weekly       # bản weekly mới nhất
