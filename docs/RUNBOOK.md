@@ -38,8 +38,10 @@ chờ của Cloudflare tunnel trên `https://hindsight-api.hieutk.dev`.
 
    Lệnh `--drill` ở trên đã từng fail trên chính bản dump này (2026-11-11)
    vì `/dev/shm` mặc định 64MiB của container `db` không đủ cho restore —
-   xem cảnh báo `shm_size` và cách áp dụng một lần ở `docs/PLAYBOOK.md`
-   mục 6, rồi chạy lại.
+   xem cảnh báo `shm_size` ở `docs/PLAYBOOK.md` mục 6. Cách áp dụng
+   (`bin/hs up -d db`) tạo lại container `db` và gây gián đoạn ngắn thật
+   sự (xem cảnh báo downtime cùng chỗ) — không chạy giữa lúc đang seed
+   hoặc có ai đang dùng Hindsight; chạy xong rồi mới `--drill` lại.
 
    **Không bao giờ chạy `POST .../banks/<bank_id>/clone`, và không bao giờ
    chạy `document-transfer`/`transfer` xuất toàn bộ `user-hieu` (export

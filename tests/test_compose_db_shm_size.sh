@@ -27,12 +27,16 @@ db_block="$(awk '
 
 [ -n "$db_block" ] || { echo "could not find a 'db:' service block in $COMPOSE"; exit 1; }
 
-shm_line="$(printf '%s\n' "$db_block" | grep -E '^\s*shm_size:' || true)"
-[ -n "$shm_line" ] || { echo "db service in compose.yaml has no shm_size (Docker's 64MiB default caused a real restore-drill failure — see docs/PLAYBOOK.md §6)"; exit 1; }
+# Exactly 4-space indent only: compose.yaml's "  db:" is 2-space, so a
+# direct key of the db service (image/restart/shm_size/...) is 4-space —
+# anything deeper (6-space, e.g. a key under db's own `environment:`) is a
+# NESTED key, not db's own shm_size, and must not match here.
+shm_line="$(printf '%s\n' "$db_block" | grep -E '^    shm_size:' || true)"
+[ -n "$shm_line" ] || { echo "db service in compose.yaml has no shm_size as a direct key (Docker's 64MiB default caused a real restore-drill failure — see docs/PLAYBOOK.md §6)"; exit 1; }
 
 # Extract the numeric value and unit, e.g. shm_size: "256m" -> 256 / m.
-value="$(printf '%s' "$shm_line" | sed -E 's/^\s*shm_size:\s*"?([0-9]+)([a-zA-Z]*)"?\s*$/\1/')"
-unit="$(printf '%s' "$shm_line" | sed -E 's/^\s*shm_size:\s*"?([0-9]+)([a-zA-Z]*)"?\s*$/\2/' | tr '[:upper:]' '[:lower:]')"
+value="$(printf '%s' "$shm_line" | sed -E 's/^[[:space:]]*shm_size:[[:space:]]*"?([0-9]+)([a-zA-Z]*)"?[[:space:]]*$/\1/')"
+unit="$(printf '%s' "$shm_line" | sed -E 's/^[[:space:]]*shm_size:[[:space:]]*"?([0-9]+)([a-zA-Z]*)"?[[:space:]]*$/\2/' | tr '[:upper:]' '[:lower:]')"
 [ -n "$value" ] || { echo "could not parse shm_size value from: $shm_line"; exit 1; }
 
 case "$unit" in

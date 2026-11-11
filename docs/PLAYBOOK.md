@@ -429,13 +429,36 @@ RAM hạn chế của server này (xem `docs/RUNBOOK.md` §0).
 trên server đang chạy — compose đổi `shm_size` không tự áp dụng cho
 container đã tồn tại, `restart` KHÔNG đủ, phải recreate):
 
+⚠️ **`bin/hs up -d db` DỪNG rồi tạo lại container `db` — gây gián đoạn
+ngắn thật sự**, không chỉ là một lệnh vô hại: container `hindsight` (và
+`chatgpt-volume-init`) KHÔNG bị đụng tới, volume `pgdata` KHÔNG mất gì,
+nhưng mọi kết nối Postgres đang mở từ `hindsight` tới `db` bị cắt ngay khi
+container cũ dừng — request retain/recall đang chạy (từ hook Claude
+Code/Codex, hoặc `seed-repo-bank.sh`) có thể fail trong vài giây, tới khi
+`hindsight` tự reconnect và container `db` mới qua được healthcheck
+(`pg_isready`, tối đa 10×10s = 100s theo cấu hình trong `compose.yaml`).
+Chọn lúc ít người/agent đang dùng Hindsight, và kiểm tra trước không có
+backup/restore/upgrade nào đang chạy (cùng khoá `flock` ở §8b):
+
+```bash
+ssh hieu@100.77.187.94 'fuser ~/hindsight/server-setup/.ops.lock 2>/dev/null; pgrep -af "bin/backup.sh|bin/upgrade.sh|bin/restore-db.sh|bin/check-upstream.sh"'
+# có output (PID) -> đợi xong hoặc hỏi người đang chạy, đừng recreate giữa chừng
+```
+
 ```bash
 ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/hs up -d db'
-# xác nhận:
+# xác nhận shm_size đã áp dụng:
 ssh hieu@100.77.187.94 'docker inspect --format "{{.HostConfig.ShmSize}}" hindsight-db-1'   # phải ra 268435456
 ```
 
-Sau đó chạy lại diễn tập để xác nhận đã hết lỗi (xem §7):
+Sau đó xác nhận cả `db` lẫn `hindsight` đều khoẻ lại trước khi coi là xong
+(không chỉ tin container đã "Up"):
+
+```bash
+ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/hs ps && bin/hs ready'
+```
+
+Rồi chạy lại diễn tập để xác nhận đã hết lỗi shm (xem §7):
 
 ```bash
 ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/restore-db.sh --drill backups/20261109-030157-pre-per-repo-pilot-20261109-db.sql.gz'
