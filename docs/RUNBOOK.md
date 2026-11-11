@@ -6,16 +6,17 @@ hội thoại thô, không xoá gì ở `user-hieu`). Script: `server-setup/bin/
 Không tự động chạy theo lịch — bạn chạy từng repo khi nhớ hoặc theo nhịp
 kiểm tra hằng tuần ở mục 4.
 
-Script này chạy trên **máy dev** (không phải trên server), gọi thẳng
-`https://hindsight-api.hieutk.dev` bằng token trong `~/.hindsight/coding-agent.json`
-(hoặc biến môi trường `HINDSIGHT_API_TOKEN`). Không cần SSH vào server.
+Script này chạy trên **máy dev** (không phải trên server), dùng token trong
+`~/.hindsight/coding-agent.json` (hoặc biến môi trường `HINDSIGHT_API_TOKEN`).
+Với lần seed thật, dùng SSH forward theo mục 1 để tránh giới hạn thời gian
+chờ của Cloudflare tunnel trên `https://hindsight-api.hieutk.dev`.
 
 ## 0. Điều kiện trước
 
 1. **Có bản backup đã xác minh khôi phục được.** Phase 1 ban đầu định dùng
    `POST .../banks/user-hieu/clone` để có một bản archive dạng bank, nhưng
    **lệnh clone đó OOM trên server** (máy chỉ có ~6 GiB RAM, nhân bản cả bank
-   633 document/7160 fact vượt quá). Quyết định cuối: **không có bank
+   vượt quá bộ nhớ). Quyết định cuối: **không có bank
    archive** — bản sao khôi phục được là file dump Postgres, theo đúng cơ chế
    backup sẵn có của repo này (`server-setup/bin/backup.sh`,
    `bin/backup-r2.sh`, xem `docs/PLAYBOOK.md` mục 5 và 6), không phải bank
@@ -42,8 +43,11 @@ Script này chạy trên **máy dev** (không phải trên server), gọi thẳn
    bao giờ làm việc này — nó chỉ export đúng tập document nhỏ cần seed cho
    một repo (`document_id` liệt kê rõ trong "Transfer candidates" ở mục 1),
    không bao giờ export cả bank.
-2. **Mốc đếm để xác nhận `user-hieu` ngừng nhận ghi mới (phase 2 đã bật trên
-   máy này)**: `user-hieu` hiện có **633 document, 7160 fact**:
+2. **Kiểm tra trạng thái bank nguồn** (phase 2 đã bật trên máy này):
+   `user-hieu` **vẫn nhận ghi mới**. Số liệu lịch sử: 633 document/7160 fact
+   ngày 2026-11-09; đến 2026-11-11 là 673 document/7605 fact. Chưa điều tra
+   nguồn ghi; chủ hệ thống quyết định tiếp tục cho ghi và di chuyển dần.
+   Có thể đọc số liệu hiện tại bằng:
 
    ```bash
    CFG=~/.hindsight/coding-agent.json
@@ -53,9 +57,7 @@ Script này chạy trên **máy dev** (không phải trên server), gọi thẳn
    # -> total_documents, total_nodes (= fact)
    ```
 
-   Đây là mốc đông lạnh; so lại số này bất cứ lúc nào để chắc `user-hieu`
-   không tăng (dynamicBankId đã bật, mọi retain mới đi vào
-   `coding-agent::{gitProject}`, không còn vào `user-hieu`).
+   Số đếm chỉ để quan sát; không dùng làm điều kiện seed hay nghỉ hưu bank.
 3. **Repo đã mở ít nhất một lần** trong Claude Code hoặc Codex với per-repo
    bank đã bật (phase 2 — đã bật trên máy này, xem `~/.hindsight/coding-agent.json`:
    `dynamicBankId: true`, `bankIdTemplate: "coding-agent::{gitProject}"`) —
@@ -65,15 +67,59 @@ Script này chạy trên **máy dev** (không phải trên server), gọi thẳn
 
 ## 1. Quy trình cho một repo
 
-**Mọi lệnh trong runbook này chạy từ gốc repo `Setup-Hindsight`** (không
-`cd server-setup` trước) — tất cả đường dẫn dưới đây (`server-setup/bin/...`,
-`server-setup/state/...`) đều viết tương đối theo gốc repo, nhất quán trong
-toàn bộ tài liệu:
+**Các lệnh seed ở mục này chạy từ gốc repo `Setup-Hindsight`** (không
+`cd server-setup` trước). Đường dẫn `server-setup/bin/...` và
+`server-setup/state/...` đều tương đối theo gốc repo.
+
+Lần `reflect` duy nhất trên `user-hieu` đã mất khoảng 250 giây cho
+`reflect` + `retain` vào 2026-11-11. Cloudflare tunnel của URL công khai
+trả HTTP 524 sau khoảng 100 giây; chỉ tăng `HINDSIGHT_SEED_HTTP_TIMEOUT`
+không giải quyết được. Chạy qua SSH forward tới cổng API trên host
+(`127.0.0.1:8888`, theo `server-setup/compose.yaml`). Thay `your-ssh-host`
+và `repo-basename` trước khi chạy; các lệnh sau chạy từ gốc repo:
 
 ```bash
-server-setup/bin/seed-repo-bank.sh <repo-basename> --dry-run   # xem kế hoạch, không ghi gì
-server-setup/bin/seed-repo-bank.sh <repo-basename>              # chạy thật
+(
+  set -e
+  SERVER=your-ssh-host
+  REPO=repo-basename
+  # Nếu SSH IdentityAgent cần XDG_RUNTIME_DIR mà phiên này chưa có:
+  # export XDG_RUNTIME_DIR=/run/user/1000  # thay UID cho đúng máy dev
+  ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:18888:127.0.0.1:8888 "$SERVER" &
+  forward_pid=$!
+  seed_config=
+  trap 'kill "$forward_pid" 2>/dev/null || true; [ -z "$seed_config" ] || rm -f "$seed_config"' EXIT
+  curl -fsS --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:18888/health
+
+  seed_config=$(mktemp)
+  chmod 600 "$seed_config"  # trước khi ghi token vào file tạm
+  python3 -I -c 'import json,sys; c=json.load(open(sys.argv[1])); c["apiUrl"]="http://127.0.0.1:18888"; json.dump(c,open(sys.argv[2],"w"))' \
+    "$HOME/.hindsight/coding-agent.json" "$seed_config"
+
+  HINDSIGHT_CODING_AGENT_CONFIG="$seed_config" HINDSIGHT_SEED_HTTP_TIMEOUT=900 \
+    server-setup/bin/seed-repo-bank.sh "$REPO" --dry-run
+
+  # Kiểm tra RAM trên host trước lần ghi thật; dừng nếu available < 1,5 GiB.
+  memory_report=$(ssh "$SERVER" free -m)
+  printf '%s\n' "$memory_report"
+  available_mib=$(printf '%s\n' "$memory_report" | awk '$1 == "Mem:" {print $7}')
+  case "$available_mib" in ''|*[!0-9]*) echo 'Không đọc được RAM available' >&2; exit 1;; esac
+  if [ "$available_mib" -lt 1536 ]; then
+    echo 'RAM available dưới 1,5 GiB; dừng seed' >&2
+    exit 1
+  fi
+  HINDSIGHT_CODING_AGENT_CONFIG="$seed_config" HINDSIGHT_SEED_HTTP_TIMEOUT=900 \
+    server-setup/bin/seed-repo-bank.sh "$REPO"
+)
 ```
+
+Subshell và `trap` luôn dừng SSH forward, xoá cấu hình tạm khi kết thúc hoặc
+gặp lỗi. Lệnh Python chỉ ghi JSON vào file đã đặt quyền `0600`, không in token.
+`HINDSIGHT_CODING_AGENT_CONFIG` chỉ đổi đường dẫn cấu hình API; script lấy
+`CONFIG_DIR` từ vị trí `seed-repo-bank.sh`, nên ledger mặc định vẫn là
+`server-setup/state/bank-seed-ledger.jsonl`, **không** chuyển sang `/tmp`.
+Nếu đã tự đặt `HINDSIGHT_SEED_LEDGER_FILE` từ trước, trỏ nó về cùng file
+ledger này trước khi seed để giữ dữ liệu rollback ở một chỗ.
 
 `<repo-basename>` là tên thư mục của **main worktree** (không phải tên một
 linked worktree) — đúng tên repo bạn thấy trong `coding-agent::<repo>`.
@@ -294,6 +340,17 @@ trong danh sách trên thì chạy mục 1 cho repo đó. Repo không còn làm 
 bỏ qua — ký ức của nó vẫn còn nguyên trong `user-hieu` (không có bank
 archive riêng — xem mục 0).
 
+### Seed lại định kỳ
+
+Vì `user-hieu` tiếp tục thay đổi và chưa rõ nguồn ghi, mỗi tuần kiểm tra và
+seed lại repo còn hoạt động khi chưa xác nhận lần seed gần nhất đã bao phủ
+các ghi mới liên quan. Đối chiếu thời điểm ghi mới với các dòng ledger;
+chỉ có tên repo trong ledger chưa chứng minh dữ liệu đã cập nhật. Chạy lại
+mục 1: các document hội thoại
+đã có ở bank đích được bỏ qua theo ID, còn document chưng cất
+`migrated:user-hieu:<repo>` giữ cùng ID và được `retain` với
+`update_mode: replace`, nên cập nhật thay vì tạo bản trùng.
+
 ## 5. Tra lại `user-hieu` cho một session cũ
 
 Bank chung `user-hieu` không bị xoá hay sửa bởi script này. Máy này đã bật
@@ -317,8 +374,7 @@ rm -f "$tmp"
 ```
 
 Thay `codex` bằng `claude` nếu cần. Hoặc hỏi trực tiếp qua API bất cứ lúc
-nào, chỉ đọc (đã dry-trace thật ở trên, `user-hieu` hiện có 633 document,
-7160 fact — mốc đông lạnh ở mục 0):
+nào, chỉ đọc (số liệu lịch sử ở mục 0 không phản ánh số hiện tại):
 
 ```bash
 printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$TOKEN" \
@@ -329,17 +385,16 @@ printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application
 
 Chỉ cân nhắc khi **đồng thời**:
 
-1. mọi repo hoạt động trong 30 ngày gần nhất đã có dòng trong ledger;
-2. `user-hieu` không nhận document mới kể từ mốc đếm ở mục 0 (so `GET
-   /v1/default/banks/user-hieu/stats` — `total_documents`/`total_nodes` —
-   với mốc 633/7160 đó);
-3. bạn xác nhận không còn cần tra trực tiếp `user-hieu` cho việc hiện tại.
+1. mọi repo hoạt động trong 30 ngày gần nhất đã được seed hoặc seed lại
+   **sau lần ghi gần nhất của repo đó vào `user-hieu`**; kiểm tra thời điểm
+   ghi và ledger, không chỉ kiểm tra repo có tên trong ledger;
+2. chủ hệ thống xác nhận không còn cần tra trực tiếp `user-hieu` cho việc hiện tại.
 
-Khi đó: đổi mô tả `user-hieu` thành "archive, chỉ đọc" (bank chính nó vẫn
+Khi đó: ghi nhận `user-hieu` là bank cũ để tra cứu (bank chính nó vẫn
 giữ nguyên — không có bank clone riêng, xem mục 0). **Giữ tối thiểu 90 ngày
 tính từ lúc nghỉ hưu** (không phải từ lúc viết runbook này) trước khi cân
-nhắc xoá. Quyết định xoá nằm ngoài phạm vi runbook này, làm riêng sau khi đã
-xác nhận không cần nữa.
+nhắc xoá. Không xoá từng document khỏi `user-hieu`; nếu xoá thì xoá **toàn bộ
+bank**, theo quyết định riêng sau khi đã xác nhận không cần nữa.
 
 **Backup thường kỳ không tự đủ 90 ngày.** Theo `docs/PLAYBOOK.md` mục 4.3,
 lifecycle rule trên bucket R2 hết hạn theo tầng: `db/6h/` **7 ngày**,
