@@ -96,7 +96,8 @@ và `repo-basename` trước khi chạy; các lệnh sau chạy từ gốc repo:
   forward_pid=$!
   seed_config=
   trap 'kill "$forward_pid" 2>/dev/null || true; [ -z "$seed_config" ] || rm -f "$seed_config"' EXIT
-  curl -fsS --retry 5 --retry-connrefused --retry-delay 1 http://127.0.0.1:18888/health
+  curl -fsS --max-time 5 --retry 5 --retry-connrefused --retry-delay 1 \
+    --retry-max-time 30 http://127.0.0.1:18888/health
 
   seed_config=$(mktemp)
   chmod 600 "$seed_config"  # trước khi ghi token vào file tạm
@@ -122,6 +123,8 @@ và `repo-basename` trước khi chạy; các lệnh sau chạy từ gốc repo:
 
 Subshell và `trap` luôn dừng SSH forward, xoá cấu hình tạm khi kết thúc hoặc
 gặp lỗi. Lệnh Python chỉ ghi JSON vào file đã đặt quyền `0600`, không in token.
+Mỗi lần thử health chỉ chờ tối đa 5 giây, toàn bộ retry tối đa 30 giây;
+kết nối treo cũng làm `curl` lỗi, `set -e` thoát subshell và chạy `trap EXIT`.
 `HINDSIGHT_CODING_AGENT_CONFIG` chỉ đổi đường dẫn cấu hình API; script lấy
 `CONFIG_DIR` từ vị trí `seed-repo-bank.sh`, nên ledger mặc định vẫn là
 `server-setup/state/bank-seed-ledger.jsonl`, **không** chuyển sang `/tmp`.
@@ -351,8 +354,124 @@ archive riêng — xem mục 0).
 
 Vì `user-hieu` tiếp tục thay đổi và chưa rõ nguồn ghi, mỗi tuần kiểm tra và
 seed lại repo còn hoạt động khi chưa xác nhận lần seed gần nhất đã bao phủ
-các ghi mới liên quan. Đối chiếu thời điểm ghi mới với các dòng ledger;
-chỉ có tên repo trong ledger chưa chứng minh dữ liệu đã cập nhật. Chạy lại
+các ghi mới liên quan. Chạy từ gốc repo, chỉ dùng GET để liệt kê **toàn bộ**
+document của `user-hieu` và so `updated_at` (lần ghi cuối, không phải
+`created_at`) với `timestamp` của dòng `stage == "distill"` mới nhất cho
+từng repo trong ledger. `GET /openapi.json` mô tả `limit`/`offset`,
+`items`/`total` và hai trường thời gian; mã plugin đặt tag `project:<repo>`
+theo cấu hình hiện tại, đặt `document_id` dạng `gitlog:<repo>` cho gitlog.
+Chỉ nhận diện repo từ tag `project:<repo>`, metadata `project`/`gitProject`
+nếu có, hoặc ID `gitlog:<repo>`. Metadata `session_id`/`ref_id` và ID
+`conversation:<session_id>` **không cho biết repo**; đường dẫn `cwd` nếu có
+cũng có thể là thư mục con hoặc linked worktree, cần đối chiếu transcript/
+main worktree riêng, không lấy basename để đoán.
+
+```bash
+python3 -I - <<'PY'
+import datetime as dt
+import json
+import pathlib
+import subprocess
+
+cfg = json.loads((pathlib.Path.home() / '.hindsight/coding-agent.json').read_text())
+ledger = pathlib.Path('server-setup/state/bank-seed-ledger.jsonl')
+last_seed = {}
+if ledger.exists():
+    for line in ledger.read_text().splitlines():
+        row = json.loads(line)
+        if row.get('stage') == 'distill' and row.get('source_bank') == 'user-hieu':
+            repo = row['repo']
+            ts = dt.datetime.fromisoformat(row['timestamp'])
+            last_seed[repo] = max(last_seed.get(repo, ts), ts)
+
+def utc(value):
+    return dt.datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(dt.timezone.utc)
+
+base = 'https://hindsight-api.hieutk.dev/v1/default/banks/user-hieu/documents'
+header = 'header = "Authorization: Bearer %s"\n' % cfg['apiToken']
+docs = {}
+offset = 0
+total = None
+while True:
+    url = '%s?limit=100&offset=%d' % (base, offset)
+    result = subprocess.run(['curl', '-fsS', '--max-time', '30', '-K', '-', url],
+                            input=header, text=True, capture_output=True, check=True)
+    page = json.loads(result.stdout)
+    if total is None:
+        total = page['total']
+    if page['total'] != total:
+        raise SystemExit('Số document đổi khi đang phân trang; chạy lại lúc yên tải')
+    for doc in page['items']:
+        if doc['id'] in docs:
+            raise SystemExit('Document lặp khi đang phân trang; chạy lại lúc yên tải')
+        docs[doc['id']] = doc
+    offset += len(page['items'])
+    if offset >= total:
+        break
+    if not page['items']:
+        raise SystemExit('Trang rỗng trước khi đọc đủ document')
+
+latest = {}
+unknown = []
+missing_time = 0
+for doc in docs.values():
+    if not doc.get('updated_at'):
+        missing_time += 1
+        continue
+    written = utc(doc['updated_at'])
+    tags = doc.get('tags') or []
+    repos = {tag.removeprefix('project:') for tag in tags
+             if tag.startswith('project:') and len(tag) > len('project:')}
+    metadata = doc.get('document_metadata') or {}
+    for key in ('project', 'gitProject'):
+        if isinstance(metadata.get(key), str) and metadata[key]:
+            repos.add(metadata[key])
+    if doc['id'].startswith('gitlog:') and doc['id'][len('gitlog:'):]:
+        repos.add(doc['id'][len('gitlog:'):])
+    if not repos:
+        unknown.append(written)
+    for repo in repos:
+        latest[repo] = max(latest.get(repo, written), written)
+
+print('documents=%d unknown_repo=%d missing_updated_at=%d' %
+      (len(docs), len(unknown), missing_time))
+print('repo\tlatest_write_utc\tlast_distill_utc\tunknown_newer_than_distill')
+for repo in sorted(latest.keys() | last_seed.keys()):
+    seed = last_seed.get(repo)
+    count = sum(t > seed for t in unknown) if seed else len(unknown)
+    print('%s\t%s\t%s\t%d' %
+          (repo, latest[repo].isoformat() if repo in latest else '-',
+           seed.astimezone(dt.timezone.utc).isoformat() if seed else 'chua-seed', count))
+PY
+```
+
+`unknown_newer_than_distill` là số document **chưa xác định được repo** ghi
+sau lần distill cuối của từng repo; `chua-seed` nghĩa là đếm toàn bộ nhóm
+không xác định. Khi chưa có ledger tại đường dẫn trên, tất cả repo đều hiện
+`chua-seed`; đọc đúng ledger trên máy đã seed trước khi quyết định. Lệnh
+không in token, ID hay nội dung document. Danh sách đang bị ghi đồng thời
+không phải snapshot: nếu tổng/ID đổi lúc phân trang, chạy lại khi yên tải.
+
+Đối chiếu riêng mốc seed trong ledger (chỉ đọc):
+
+```bash
+jq -rs '
+  map(select(.stage == "distill" and .source_bank == "user-hieu"))
+  | group_by(.repo)[]
+  | "\(.[0].repo)\t\(map(.timestamp) | max)"
+' server-setup/state/bank-seed-ledger.jsonl
+```
+
+Nếu `latest_write_utc` muộn hơn `last_distill_utc`, seed lại repo đó.
+Document không có tag/metadata repo (đặc biệt từ cấu hình static-bank cũ)
+không thể gán đúng repo chỉ bằng danh sách API. Nếu bộ đếm `unknown` sau
+mốc seed lớn hơn 0, đối chiếu transcript cục bộ để xác định chủ sở hữu;
+nếu không xác định được thì seed lại **mọi repo còn hoạt động**. Mốc ledger
+cho biết lần distill hoàn tất, không chứng minh document không gắn repo đã
+được bao phủ; không coi `unknown == 0` là bằng chứng tuyệt đối nếu có
+document thiếu `updated_at`.
+
+Chỉ có tên repo trong ledger chưa chứng minh dữ liệu đã cập nhật. Chạy lại
 mục 1: các document hội thoại
 đã có ở bank đích được bỏ qua theo ID, còn document chưng cất
 `migrated:user-hieu:<repo>` giữ cùng ID và được `retain` với
@@ -394,7 +513,8 @@ Chỉ cân nhắc khi **đồng thời**:
 
 1. mọi repo hoạt động trong 30 ngày gần nhất đã được seed hoặc seed lại
    **sau lần ghi gần nhất của repo đó vào `user-hieu`**; kiểm tra thời điểm
-   ghi và ledger, không chỉ kiểm tra repo có tên trong ledger;
+   ghi bằng lệnh mục 4 và ledger, xử lý nhóm `unknown` trước khi kết luận,
+   không chỉ kiểm tra repo có tên trong ledger;
 2. chủ hệ thống xác nhận không còn cần tra trực tiếp `user-hieu` cho việc hiện tại.
 
 Khi đó: ghi nhận `user-hieu` là bank cũ để tra cứu (bank chính nó vẫn
