@@ -85,6 +85,12 @@ không giải quyết được. Chạy qua SSH forward tới cổng API trên ho
 (`127.0.0.1:8888`, theo `server-setup/compose.yaml`). Thay `your-ssh-host`
 và `repo-basename` trước khi chạy; các lệnh sau chạy từ gốc repo:
 
+Ngày 2026-11-25, một repo khác gặp đúng giới hạn 300s của server hai lần.
+`HINDSIGHT_API_REFLECT_WALL_TIMEOUT=840` trong `base.env` cần được áp dụng
+bằng cách tạo lại container API theo PLAYBOOK §3 trước khi seed lại; client
+900s qua SSH forward vẫn chờ lâu hơn server 60s. Không áp dụng khi một lượt
+seed khác còn chạy vì việc tạo lại API sẽ ngắt request đang xử lý.
+
 ```bash
 (
   set -e

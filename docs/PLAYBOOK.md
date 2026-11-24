@@ -109,6 +109,38 @@ Chạy trên server, trong `~/hindsight/server-setup`:
 > luôn dùng `bin/hs up -d`. Container restart, config cũ giữ nguyên — lỗi im
 > lặng giống hệt Multica (xem RUNBOOK §8 bên đó).
 
+### Thời hạn `reflect` trên server
+
+Hindsight 1.2.3 đọc `HINDSIGHT_API_REFLECT_WALL_TIMEOUT` (giây) từ env khi
+khởi động API; mặc định upstream là 300s. `base.env` đặt 840s và
+`compose.yaml` truyền giá trị đó vào container `hindsight`. Ngày 2026-11-25,
+seed repo Setup-Omnigent đã hai lần gặp lỗi server `Reflect operation timed
+out after 300 seconds` dù dùng `budget: "low"`. Giới hạn 840s chừa 60s trước
+`HINDSIGHT_SEED_HTTP_TIMEOUT=900` của client qua SSH forward. URL công khai
+qua Cloudflare vẫn có thể trả HTTP 524 sau khoảng 100s; seed dài phải dùng
+SSH forward theo RUNBOOK §1. LLM timeout (mặc định 30s cho mỗi call reflect)
+và DB statement timeout (mặc định 600s cho mỗi statement) là giới hạn riêng,
+không phải hạn tổng cho cả reflect.
+
+Sau khi cập nhật checkout trên server, chọn lúc ít người/agent dùng API và
+đợi seed, backup, restore, upgrade đang chạy hoàn tất. Phối hợp với người
+đang seed từ máy client: `pgrep` trên server không thấy process seed qua SSH
+forward ở máy khác. Kiểm tra khoá vận hành như cảnh báo `shm_size` ở §6,
+rồi áp dụng riêng service API:
+
+```bash
+ssh hieu@100.77.187.94 'lslocks --output PID,COMMAND,PATH | grep -F .ops.lock || true'
+# Có PID liên quan -> đợi công việc đó xong trước khi áp dụng.
+ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/hs up -d --no-deps hindsight'
+ssh hieu@100.77.187.94 'cd ~/hindsight/server-setup && bin/hs ps && bin/hs ready'
+```
+
+`up -d --no-deps hindsight` tạo lại container API để đọc env mới, không tạo
+lại `db`; `bin/hs restart` không đủ. API gián đoạn ngắn khi container cũ dừng
+và container mới khởi động; request đang chạy (gồm seed) có thể lỗi. Lệnh
+`bin/hs` vẫn kiểm tra credential và có thể bảo đảm service
+`chatgpt-volume-init` đã hoàn tất trước khi khởi động API.
+
 ### Đổi tên Compose project từ `server-setup` (một lần)
 
 Chạy sau khi cập nhật repo trên server, **trước** lệnh `bin/hs up -d` đầu
@@ -441,7 +473,7 @@ Chọn lúc ít người/agent đang dùng Hindsight, và kiểm tra trước kh
 backup/restore/upgrade nào đang chạy (cùng khoá `flock` ở §8b):
 
 ```bash
-ssh hieu@100.77.187.94 'fuser ~/hindsight/server-setup/.ops.lock 2>/dev/null; pgrep -af "bin/backup.sh|bin/upgrade.sh|bin/restore-db.sh|bin/check-upstream.sh"'
+ssh hieu@100.77.187.94 'lslocks --output PID,COMMAND,PATH | grep -F .ops.lock || true'
 # có output (PID) -> đợi xong hoặc hỏi người đang chạy, đừng recreate giữa chừng
 ```
 
@@ -791,7 +823,7 @@ bình thường. Trước khi `stop`/`restart` tay, kiểm xem có đang chạy 
 
 ```bash
 systemctl --user status hindsight-upgrade-check     # "active (running)"?
-fuser server-setup/.ops.lock 2>/dev/null             # PID nào đang giữ khoá?
+lslocks --output PID,COMMAND,PATH | grep -F .ops.lock # PID nào đang giữ khoá?
 pgrep -af 'bin/upgrade.sh|bin/restore-db.sh'         # đang upgrade/restore?
 ```
 
@@ -835,7 +867,7 @@ Unit `hindsight-backup@.service` và `hindsight-upgrade-check.service` gửi Tel
 | Timer không chạy sau khi SSH logout | chưa `loginctl enable-linger` | `bin/install-systemd.sh` tự kiểm tra, báo lỗi rõ nếu cần `sudo` làm thay |
 | Diễn tập restore fail "table missing/empty" | xem §7 "Đọc kết quả thế nào" | |
 | `check-upstream.sh` không gửi Telegram | `ops-notify` chưa cài hoặc gửi lỗi | cài từ Setup-Omnigent RUNBOOK §8, chạy `~/.local/bin/ops-notify --test`, xem `journalctl --user -u hindsight-upgrade-check` |
-| `check-upstream.sh`/`upgrade.sh`/`backup.sh`/`restore-db.sh` báo "could not acquire .ops.lock" | một script khác trong cùng nhóm đang giữ khoá chung (§8b) lâu hơn timeout | `fuser server-setup/.ops.lock`/`pgrep -af 'bin/upgrade.sh\|bin/restore-db.sh'` xem ai đang chạy; đợi xong hoặc tăng `HINDSIGHT_OPS_LOCK_TIMEOUT` |
+| `check-upstream.sh`/`upgrade.sh`/`backup.sh`/`restore-db.sh` báo "could not acquire .ops.lock" | một script khác trong cùng nhóm đang giữ khoá chung (§8b) lâu hơn timeout | `lslocks --output PID,COMMAND,PATH | grep -F .ops.lock` xem ai đang giữ khoá; đợi xong hoặc tăng `HINDSIGHT_OPS_LOCK_TIMEOUT` |
 | `check-upstream.sh` báo thiếu `python3` ngay dòng đầu | `python3` không có trên `PATH` | cài `python3` (đã là dependency bắt buộc của `bin/install-systemd.sh`) |
 | Patch mới nhưng tin Telegram báo "auto-upgrade blocked (repo not clean)" | repo trên server dirty hoặc `main` lệch `origin/main` | `git -C ~/hindsight status`, `git pull`/`git stash` rồi chạy tay `bin/upgrade.sh X.Y.Z` |
 | Tin Telegram báo "...failed AND rollback failed — manual action needed" | upgrade fail sau khi có dump, và việc VERIFY auto-rollback cũng fail (`upgrade.sh` exit `3`) | làm theo lệnh restore tay trong tin Telegram NGAY (§6/§8), đừng đợi lần chạy tuần sau |
